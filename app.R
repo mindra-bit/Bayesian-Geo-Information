@@ -998,3 +998,1529 @@ server <- function(input,output,session){
 
   output$live_map_title <- renderText({
     switch(input$live_layer,
+      study="Study Area and Lembang Fault",
+      earthquake="BMKG Earthquake Catalog",
+      vs30="Vs30 Grid Points",
+      vs30_district="District Mean Vs30",
+      bps=paste("BPS Choropleth —",input$map_bps_var,input$map_bps_year),
+      scenario=paste0("Scenario PGA — Mw ",input$scenario_mw,", depth ",input$scenario_depth," km"),
+      paper_hazard="Paper Output — Posterior Hazard Mean",
+      paper_exposure="Paper Output — Exposure Index",
+      paper_vulnerability="Paper Output — Vulnerability Index",
+      paper_screening="Paper Output — Integrated Screening Score"
+    )
+  })
+
+  outputOptions(output,"live_map",suspendWhenHidden=FALSE)
+
+  refresh_leaflet_2d <- function(){ send_clean_message("refreshLeaflet2D",list()) }
+  observeEvent(input$main_nav,{ if(identical(input$main_nav,"live_map") && identical(input$map_mode,"2d")) refresh_leaflet_2d() },ignoreInit=TRUE)
+  observeEvent(input$map_mode,{ if(identical(input$map_mode,"2d")) refresh_leaflet_2d() },ignoreInit=TRUE)
+  observeEvent(input$refresh_2d_map,{ refresh_leaflet_2d() },ignoreInit=TRUE)
+  observeEvent(input$live_layer,{ if(identical(input$main_nav,"live_map") && identical(input$map_mode,"2d")) refresh_leaflet_2d() },ignoreInit=TRUE)
+
+  output$live_map <- renderLeaflet({
+    z <- live_map_data()
+
+    m <- leaflet(options=leafletOptions(
+      preferCanvas=TRUE,
+      minZoom=5,
+      zoomControl=TRUE
+    ))
+    m <- add_basemap(m,input$basemap_choice)
+
+    # Always start from the study region so a meaningful map is visible.
+    m <- m |> setView(lng=107.55,lat=-6.92,zoom=8)
+
+    if(z$type=="study"){
+      pal <- colorFactor(
+        c("#1B6A85","#21516B","#2D7D78","#365B80","#5B617A",
+          "#31766A","#477F92","#3B6E8D","#536D73"),
+        domain=as.character(z$districts$kabupaten_kota)
+      )
+      bb <- sf::st_bbox(z$districts)
+      m <- m |>
+        addPolygons(
+          data=z$districts,
+          fillColor=~pal(as.character(kabupaten_kota)),
+          fillOpacity=.40,
+          color="#D8E8F2",
+          weight=.8,
+          popup=~paste0("<b>",kabupaten_kota,"</b><br>",kecamatan),
+          group="Districts"
+        ) |>
+        addPolylines(
+          data=z$fault,
+          color="#FF4838",
+          weight=5,
+          opacity=1,
+          group="Lembang Fault"
+        ) |>
+        addLegend(
+          "bottomright",
+          pal=pal,
+          values=as.character(z$districts$kabupaten_kota),
+          title="Regency / City"
+        ) |>
+        fitBounds(
+          as.numeric(unname(bb["xmin"])),
+          as.numeric(unname(bb["ymin"])),
+          as.numeric(unname(bb["xmax"])),
+          as.numeric(unname(bb["ymax"]))
+        )
+    }
+
+    if(z$type=="earthquake"){
+      x <- z$points
+
+      if(is.null(x) || nrow(x)==0){
+        m <- m |>
+          addControl(
+            html="<div class='map-empty-note'><b>No earthquake events</b><br>Adjust magnitude or depth filters.</div>",
+            position="topright"
+          )
+      } else {
+        pal <- colorNumeric(
+          c("#FFE66D","#FF9F43","#FF5D4A","#B5173D"),
+          domain=x$Magnitude
+        )
+        m <- m |>
+          addCircleMarkers(
+            data=x,
+            lng=~Longitude,
+            lat=~Latitude,
+            radius=~pmax(2,pmin(9,(Magnitude-2)*1.2)),
+            stroke=FALSE,
+            fillOpacity=.78,
+            color=~pal(Magnitude),
+            popup=~paste0(
+              "<b>M ",Magnitude,"</b><br>",
+              Date,
+              "<br>Depth: ",`Depth (km)`," km",
+              "<br>Type: ",`Mag Type`
+            ),
+            group="Earthquakes"
+          ) |>
+          addPolylines(
+            data=z$fault,
+            color="#FF4838",
+            weight=4,
+            opacity=.95,
+            group="Lembang Fault"
+          ) |>
+          addLegend(
+            "bottomright",
+            pal=pal,
+            values=x$Magnitude,
+            title="Magnitude"
+          ) |>
+          fitBounds(
+            min(x$Longitude,na.rm=TRUE),
+            min(x$Latitude,na.rm=TRUE),
+            max(x$Longitude,na.rm=TRUE),
+            max(x$Latitude,na.rm=TRUE)
+          )
+      }
+    }
+
+    if(z$type=="vs30"){
+      x <- z$points
+
+      if(is.null(x) || nrow(x)==0){
+        m <- m |>
+          addControl(
+            html="<div class='map-empty-note'><b>No Vs30 grid points</b><br>Adjust the Vs30 range.</div>",
+            position="topright"
+          )
+      } else {
+        pal <- colorNumeric(
+          c("#3F007D","#2C7FB8","#41B6C4","#A1DAB4","#FFFFCC"),
+          domain=x$vs30_mosaic
+        )
+        m <- m |>
+          addCircleMarkers(
+            data=x,
+            lng=~longitude,
+            lat=~latitude,
+            radius=3,
+            stroke=FALSE,
+            fillOpacity=.76,
+            color=~pal(vs30_mosaic),
+            popup=~paste0("<b>Vs30:</b> ",round(vs30_mosaic,1)," m/s"),
+            group="Vs30"
+          ) |>
+          addPolylines(
+            data=z$fault,
+            color="#FF4838",
+            weight=4,
+            opacity=.95,
+            group="Lembang Fault"
+          ) |>
+          addLegend(
+            "bottomright",
+            pal=pal,
+            values=x$vs30_mosaic,
+            title="Vs30 (m/s)"
+          ) |>
+          fitBounds(
+            min(x$longitude,na.rm=TRUE),
+            min(x$latitude,na.rm=TRUE),
+            max(x$longitude,na.rm=TRUE),
+            max(x$latitude,na.rm=TRUE)
+          )
+      }
+    }
+
+    if(z$type=="bps"){
+      p <- z$polygons
+
+      pal <- colorNumeric(
+        c("#081D58","#225EA8","#41B6C4","#C7E9B4","#FFFFD9"),
+        domain=p$map_value,
+        na.color="#46525C"
+      )
+
+      bb <- sf::st_bbox(p)
+      m <- m |>
+        addPolygons(
+          data=p,
+          fillColor=~pal(map_value),
+          fillOpacity=.74,
+          color="#D9E7EF",
+          weight=.65,
+          popup=~paste0(
+            "<b>",kabupaten_kota," — ",kecamatan,"</b><br>",
+            z$indicator,": ",
+            ifelse(is.na(map_value),"NA",format(round(map_value,2),big.mark=","))
+          ),
+          group="BPS indicator"
+        ) |>
+        addPolylines(
+          data=z$fault,
+          color="#FF4838",
+          weight=4,
+          opacity=1,
+          group="Lembang Fault"
+        ) |>
+        addLegend(
+          "bottomright",
+          pal=pal,
+          values=p$map_value,
+          title=paste(z$indicator,z$year)
+        ) |>
+        fitBounds(
+          as.numeric(unname(bb["xmin"])),
+          as.numeric(unname(bb["ymin"])),
+          as.numeric(unname(bb["xmax"])),
+          as.numeric(unname(bb["ymax"]))
+        )
+    }
+
+
+    if(z$type=="vs30_district"){
+      p <- z$polygons
+      pal <- colorNumeric(
+        c("#440154","#31688E","#35B779","#FDE725"),
+        domain=p$Vs30_mean,
+        na.color="#46525C"
+      )
+      bb <- st_bbox(p)
+      m <- m |>
+        addPolygons(
+          data=p,
+          fillColor=~pal(Vs30_mean),
+          fillOpacity=.78,
+          color="#D9E7EF",
+          weight=.65,
+          popup=~paste0(
+            "<b>",kabupaten_kota," — ",kecamatan,"</b><br>",
+            "Mean Vs30: ",ifelse(is.na(Vs30_mean),"NA",sprintf("%.1f",Vs30_mean))," m/s<br>",
+            "Grid cells: ",ifelse(is.na(n_grid),"NA",n_grid)
+          ),
+          group="District mean Vs30"
+        ) |>
+        addPolylines(data=z$fault,color="#FF4838",weight=4,opacity=1) |>
+        addLegend("bottomright",pal=pal,values=p$Vs30_mean,title="Mean Vs30 (m/s)") |>
+        fitBounds(
+          as.numeric(unname(bb["xmin"])),as.numeric(unname(bb["ymin"])),
+          as.numeric(unname(bb["xmax"])),as.numeric(unname(bb["ymax"]))
+        )
+    }
+
+    if(z$type=="paper"){
+      if(!file.exists(live_screening_path)){
+        d <- get_districts()
+        bb <- st_bbox(d)
+        m <- m |>
+          addPolygons(data=d,fillColor="#243746",fillOpacity=.18,
+                      color="#8EA9B9",weight=.65) |>
+          addPolylines(data=z$fault,color="#FF4838",weight=4,opacity=1) |>
+          addControl(
+            html="<div class='map-empty-note'><b>Paper-derived map not available yet.</b><br>Run INLA Diagnostics → Run Full INLA Workflow to generate this layer.</div>",
+            position="topright"
+          ) |>
+          fitBounds(
+            as.numeric(unname(bb["xmin"])),as.numeric(unname(bb["ymin"])),
+            as.numeric(unname(bb["xmax"])),as.numeric(unname(bb["ymax"]))
+          )
+      } else {
+        dd <- readr::read_csv(live_screening_path,show_col_types=FALSE)
+        dd$key <- paste(clean_key(dd$kabupaten),clean_key(dd$kecamatan),sep="__")
+        p <- dplyr::left_join(get_districts(),dd,by="key")
+        vals <- p[[z$variable]]
+        pal <- colorNumeric(
+          c("#081D58","#225EA8","#41B6C4","#FDE725"),
+          domain=vals,
+          na.color="#46525C"
+        )
+        bb <- st_bbox(p)
+        m <- m |>
+          addPolygons(
+            data=p,
+            fillColor=pal(vals),
+            fillOpacity=.78,
+            color="#D9E7EF",
+            weight=.65,
+            popup=paste0(
+              "<b>",p$kabupaten_kota," — ",p$kecamatan,"</b><br>",
+              z$title,": ",
+              ifelse(is.na(vals),"NA",ifelse(abs(vals)<0.001,format(vals,scientific=TRUE,digits=4),sprintf("%.4f",vals)))
+            )
+          ) |>
+          addPolylines(data=z$fault,color="#FF4838",weight=4,opacity=1) |>
+          addLegend("bottomright",pal=pal,values=vals,title=z$title) |>
+          fitBounds(
+            as.numeric(unname(bb["xmin"])),as.numeric(unname(bb["ymin"])),
+            as.numeric(unname(bb["xmax"])),as.numeric(unname(bb["ymax"]))
+          )
+      }
+    }
+
+    if(z$type=="scenario"){
+      p <- z$polygons
+
+      pal <- colorNumeric(
+        c("#081D58","#225EA8","#41B6C4","#FDE725","#FF5A36"),
+        domain=p$PGA_scenario,
+        na.color="#46525C"
+      )
+
+      bb <- sf::st_bbox(p)
+      m <- m |>
+        addPolygons(
+          data=p,
+          fillColor=~pal(PGA_scenario),
+          fillOpacity=.80,
+          color="#D9E7EF",
+          weight=.6,
+          popup=~paste0(
+            "<b>",kabupaten_kota," — ",kecamatan,"</b><br>",
+            "PGA proxy: ",sprintf("%.3f",PGA_scenario)," g<br>",
+            "Vs30 mean: ",sprintf("%.1f",Vs30_mean)," m/s<br>",
+            "Distance to fault: ",sprintf("%.1f",Distance_to_fault_km)," km<br>",
+            "Above ",z$threshold," g: ",ifelse(Above_threshold,"Yes","No")
+          ),
+          group="Scenario PGA"
+        ) |>
+        addPolylines(
+          data=z$fault,
+          color="#FF3028",
+          weight=5,
+          opacity=1,
+          group="Lembang Fault"
+        ) |>
+        addLegend(
+          "bottomright",
+          pal=pal,
+          values=p$PGA_scenario,
+          title="PGA proxy (g)"
+        ) |>
+        fitBounds(
+          as.numeric(unname(bb["xmin"])),
+          as.numeric(unname(bb["ymin"])),
+          as.numeric(unname(bb["xmax"])),
+          as.numeric(unname(bb["ymax"]))
+        )
+    }
+
+    m
+  })
+
+
+  # -------- 3D TERRAIN MAP --------
+  map3d_state <- reactiveVal("idle")
+  map3d_message <- reactiveVal(
+    "Switch to 3D Terrain to initialize the terrain map. Internet access is required for MapLibre and terrain tiles."
+  )
+
+  observe({
+    req(input$main_nav=="live_map",input$map_mode=="3d")
+
+    map3d_state("loading")
+    map3d_message("Preparing 3D terrain data...")
+
+    tryCatch({
+      z <- live_map_data()
+      tc <- map3d_tile_config(input$basemap_choice)
+
+      fault_coords <- tryCatch(
+        get_fault_coords_3d(),
+        error=function(e) list()
+      )
+
+      pts <- make_3d_points(z)
+
+      if(length(pts)>5000){
+        pts <- pts[
+          unique(
+            round(
+              seq(1,length(pts),length.out=5000)
+            )
+          )
+        ]
+      }
+
+      boundaries <- tryCatch(
+        get_boundary_features_3d(),
+        error=function(e) list()
+      )
+
+      send_clean_message(
+        "updateIJGI3D",
+        list(
+          centerLon=107.60,
+          centerLat=-6.88,
+          zoom=8.7,
+          exaggeration=input$terrain_exaggeration %||% 1.6,
+          tileUrl=tc$url,
+          attribution=tc$attribution,
+          maxZoom=tc$max_zoom,
+          boundaries=boundaries,
+          fault=fault_coords,
+          points=pts
+        )
+      )
+
+      map3d_state("ready")
+      map3d_message(
+        paste0(
+          "3D payload ready · ",
+          length(pts)," analytical points · ",
+          length(boundaries)," boundary segments. ",
+          "If the terrain canvas remains blank, check internet access to unpkg.com and elevation tile services."
+        )
+      )
+    },error=function(e){
+      map3d_state("error")
+      map3d_message(
+        paste("3D terrain preparation failed:",conditionMessage(e))
+      )
+    })
+  })
+
+  output$map3d_status <- renderUI({
+    st <- map3d_state()
+    cls <- if(identical(st,"error")){
+      "map3d-status map3d-status-error"
+    } else if(identical(st,"loading")){
+      "map3d-status map3d-status-loading"
+    } else {
+      "map3d-status map3d-status-ready"
+    }
+    div(class=cls,map3d_message())
+  })
+
+  observeEvent(input$map_mode,{
+    if(identical(input$map_mode,"3d")){
+      send_clean_message("resizeIJGI3D",list())
+    }
+  },ignoreInit=TRUE)
+
+  # -------- RAW EXPLORER --------
+  current_data <- eventReactive(input$refresh_explorer,{
+    switch(input$explore_dataset,
+      BPS={
+        x <- data.table::copy(get_bps())
+        if(!is.null(input$filter_bps_year)) x <- x[Tahun>=input$filter_bps_year[1]&Tahun<=input$filter_bps_year[2]]
+        x
+      },
+      BMKG={
+        x <- data.table::copy(get_bmkg())
+        if(!is.null(input$filter_mag)) x <- x[Magnitude>=input$filter_mag[1]&Magnitude<=input$filter_mag[2]]
+        if(!is.null(input$filter_depth)) x <- x[`Depth (km)`>=input$filter_depth[1]&`Depth (km)`<=input$filter_depth[2]]
+        x
+      },
+      VS30={
+        x <- data.table::copy(get_vs30())
+        if(!is.null(input$filter_vs30)) x <- x[vs30_mosaic>=input$filter_vs30[1]&vs30_mosaic<=input$filter_vs30[2]]
+        x
+      }
+    )
+  },ignoreNULL=FALSE)
+
+  output$explore_filters <- renderUI({
+    switch(input$explore_dataset,
+      BPS=sliderInput("filter_bps_year","Year",2019,2025,c(2019,2025),1,sep=""),
+      BMKG=tagList(
+        sliderInput("filter_mag","Magnitude",0,9,c(0,9),.1),
+        sliderInput("filter_depth","Depth (km)",0,700,c(0,700),10)
+      ),
+      VS30=sliderInput("filter_vs30","Vs30",0,1600,c(0,1600),25)
+    )
+  })
+
+  output$variable_selectors <- renderUI({
+    x <- current_data()
+    nums <- names(x)[vapply(x,is.numeric,logical(1))]
+    alln <- names(x)
+
+    defaults <- switch(input$explore_dataset,
+      BPS=list(type="line",x="Tahun",y="Faskes",color=""),
+      BMKG=list(type="scatter",x="Longitude",y="Latitude",color="Magnitude"),
+      VS30=list(type="scatter",x="longitude",y="latitude",color="vs30_mosaic")
+    )
+
+    div(class="explorer-selector-grid",
+        selectInput("plot_type","Plot type",
+                    choices=c("Histogram"="hist","Scatter"="scatter","Boxplot"="box","Line / trend"="line"),
+                    selected=defaults$type),
+        selectInput("x_var","X variable",choices=alln,selected=defaults$x),
+        selectInput("y_var","Y variable",choices=c("(none)"="",nums),selected=defaults$y),
+        selectInput("color_var","Color / group",choices=c("(none)"="",alln),selected=defaults$color)
+    )
+  })
+
+  output$raw_table <- renderDT({
+    datatable(as.data.frame(head(current_data(),input$preview_n)),rownames=FALSE,
+              class="stripe hover compact",options=list(scrollX=TRUE,pageLength=25))
+  })
+  output$missing_table <- renderDT({
+    datatable(missingness_table(as.data.frame(current_data())),rownames=FALSE,
+              options=list(dom="t",pageLength=20)) |> formatRound("missing_pct",1)
+  })
+  output$numeric_summary_table <- renderDT({
+    z <- numeric_summary(as.data.frame(current_data()))
+    dt <- datatable(z,rownames=FALSE,options=list(scrollX=TRUE,pageLength=20))
+    if(nrow(z)) dt <- dt |> formatRound(setdiff(names(z),c("variable","n")),3)
+    dt
+  })
+
+  output$explore_plot <- renderPlotly({
+    x <- as.data.frame(safe_sample(current_data(),20000))
+    req(input$x_var)
+    blank <- function(msg) {
+      plot_ly() %>% layout(
+        paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
+        font=list(color=axis_color()),
+        annotations=list(list(text=msg,x=.5,y=.5,xref="paper",yref="paper",showarrow=FALSE,font=list(size=16)))
+      )
+    }
+
+    if(input$plot_type=="hist"){
+      if(!is.numeric(x[[input$x_var]])) return(blank("Select a numeric X variable"))
+      p <- ggplot(x,aes(x=.data[[input$x_var]]))+
+        geom_histogram(bins=35,fill="#27B7FF",alpha=.85)
+    } else if(input$plot_type=="scatter"){
+      if(input$y_var=="" || !is.numeric(x[[input$x_var]]) || !is.numeric(x[[input$y_var]]))
+        return(blank("Scatter plot requires numeric X and Y variables"))
+      if(input$color_var!="" && is.numeric(x[[input$color_var]])){
+        p <- ggplot(x,aes(x=.data[[input$x_var]],y=.data[[input$y_var]],color=.data[[input$color_var]]))+
+          geom_point(alpha=.65,size=1.8)+scale_color_viridis_c()
+      } else if(input$color_var!=""){
+        p <- ggplot(x,aes(x=.data[[input$x_var]],y=.data[[input$y_var]],color=as.factor(.data[[input$color_var]])))+
+          geom_point(alpha=.65,size=1.8)
+      } else {
+        p <- ggplot(x,aes(x=.data[[input$x_var]],y=.data[[input$y_var]]))+
+          geom_point(alpha=.60,size=1.8,color="#27B7FF")
+      }
+    } else if(input$plot_type=="box"){
+      if(input$y_var=="" || !is.numeric(x[[input$y_var]]))
+        return(blank("Boxplot requires a numeric Y variable"))
+      p <- ggplot(x,aes(x=as.factor(.data[[input$x_var]]),y=.data[[input$y_var]]))+
+        geom_boxplot(fill="#2AD4C9",alpha=.72)+coord_flip()
+    } else {
+      if(input$y_var=="" || !is.numeric(x[[input$y_var]]))
+        return(blank("Trend plot requires a numeric Y variable"))
+      x_plot <- x[is.finite(x[[input$y_var]]) & !is.na(x[[input$x_var]]),,drop=FALSE]
+      if(nrow(x_plot)==0) return(blank("No finite values available for this trend plot"))
+      p <- ggplot(x_plot,aes(x=.data[[input$x_var]],y=.data[[input$y_var]]))+
+        stat_summary(fun=mean,geom="line",color="#27B7FF",linewidth=1.0,na.rm=TRUE)+
+        stat_summary(fun=mean,geom="point",color="#2AD4C9",size=2.5,na.rm=TRUE)
+    }
+    p <- p + transparent_theme() + labs(x=input$x_var,y=if(input$y_var=="")NULL else input$y_var)
+    plotly_transparent(p)
+  })
+
+  # -------- RUNNER --------
+  audit_result <- eventReactive(input$run_audit,{
+    b <- get_bps(); e <- get_bmkg(); v <- get_vs30()
+    data.frame(
+      dataset=c("BPS socioeconomic panel","BMKG earthquake catalog","Vs30 grid"),
+      rows=c(nrow(b),nrow(e),nrow(v)),
+      columns=c(ncol(b),ncol(e),ncol(v)),
+      missing_cells=c(sum(is.na(b)),sum(is.na(e)),sum(is.na(v)))
+    )
+  })
+  output$audit_table <- renderDT({
+    req(audit_result())
+    datatable(
+      audit_result(),
+      rownames=FALSE,
+      class="stripe hover compact",
+      options=list(
+        dom="t",
+        scrollX=TRUE,
+        autoWidth=TRUE,
+        columnDefs=list(
+          list(width="46%",targets=0),
+          list(width="18%",targets=1),
+          list(width="18%",targets=2),
+          list(width="18%",targets=3)
+        )
+      )
+    )
+  })
+  output$audit_status <- renderUI({
+    req(input$run_audit)
+    div(class="note-box","Audit completed directly from data/raw/.")
+  })
+
+  eq_analysis <- eventReactive(input$run_eq,{
+    x <- data.table::copy(get_bmkg())
+    x <- x[Magnitude>=input$runner_mag & `Depth (km)`<=input$runner_depth & !is.na(Date_parsed)]
+    x[,year:=as.integer(format(Date_parsed,"%Y"))]
+    x[year>=1998 & year<=2024,.N,by=year]
+  })
+  output$runner_eq_plot <- renderPlotly({
+    d <- eq_analysis(); req(nrow(d))
+    p <- ggplot(d,aes(year,N))+geom_col(fill="#27B7FF")+
+      labs(x="Year",y="Events")+transparent_theme()
+    plotly_transparent(p)
+  })
+
+  bps_analysis <- eventReactive(input$run_bps,{
+    x <- data.table::copy(get_bps())
+    x <- x[Tahun>=input$bps_years[1]&Tahun<=input$bps_years[2]]
+    x[,value:=suppressWarnings(as.numeric(get(input$bps_indicator)))]
+    x[,.(mean_value=mean(value,na.rm=TRUE)),by=Tahun]
+  })
+  output$runner_bps_plot <- renderPlotly({
+    d <- bps_analysis()
+    req(nrow(d))
+    p <- ggplot(d,aes(Tahun,mean_value))+
+      geom_line(color="#2AD4C9",linewidth=1.1)+
+      geom_point(color="#2AD4C9",size=2.8)+
+      labs(y=paste("Mean",input$bps_indicator))+
+      transparent_theme()
+    plotly_transparent(p)
+  })
+
+  # -------- TRUE INLA RUN GATE --------
+  live_diag_path <- file.path("data","derived","model_comparison_live.csv")
+  live_screening_path <- file.path("data","derived","screening_map_live.csv")
+  inla_log_path <- file.path("data","derived","inla_run.log")
+  inla_err_path <- file.path("data","derived","inla_error.log")
+
+  inla_metrics <- reactiveVal(
+    if(file.exists(live_diag_path)){
+      readr::read_csv(live_diag_path,show_col_types=FALSE)
+    } else NULL
+  )
+  inla_status <- reactiveVal(
+    if(file.exists(live_diag_path)){
+      "Existing diagnostics were found from a previous completed run."
+    } else {
+      "INLA has not been run in this project session."
+    }
+  )
+  inla_state <- reactiveVal(if(file.exists(live_diag_path)) "done" else "idle")
+  inla_started_at <- reactiveVal(NULL)
+  inla_process <- reactiveVal(NULL)
+  inla_pid <- reactiveVal(NA_integer_)
+
+  tail_inla_log <- function(n=16){
+    read_one <- function(path){
+      if(!file.exists(path)) return(character())
+      tryCatch(
+        readLines(path,warn=FALSE,encoding="UTF-8"),
+        error=function(e) character()
+      )
+    }
+
+    out <- read_one(inla_log_path)
+    err <- read_one(inla_err_path)
+
+    zz <- c(
+      if(length(out)) c("[stdout]",out) else character(),
+      if(length(err)) c("[stderr]",err) else character()
+    )
+
+    if(!length(zz)) return("INLA process started; waiting for log output...")
+    paste(utils::tail(zz,n),collapse="\n")
+  }
+
+  inla_error_summary <- function(n=6){
+    read_one <- function(path){
+      if(!file.exists(path)) return(character())
+      tryCatch(
+        readLines(path,warn=FALSE,encoding="UTF-8"),
+        error=function(e) character()
+      )
+    }
+
+    err <- read_one(inla_err_path)
+    out <- read_one(inla_log_path)
+    z <- c(err,out)
+    z <- z[nzchar(trimws(z))]
+    if(!length(z)) return("No error text was written by the child R process.")
+
+    # Prefer explicit error/failure lines when present.
+    hit <- grep(
+      "Error|Execution halted|Quitting from lines|failed|cannot|could not|not found|there is no package",
+      z,
+      ignore.case=TRUE
+    )
+    if(length(hit)){
+      j <- max(hit)
+      lo <- max(1,j-2)
+      hi <- min(length(z),j+2)
+      return(paste(z[lo:hi],collapse="\n"))
+    }
+
+    paste(utils::tail(z,n),collapse="\n")
+  }
+
+  observeEvent(input$run_inla,{
+    current <- inla_process()
+    if(!is.null(current)){
+      alive <- tryCatch(current$is_alive(),error=function(e) FALSE)
+      if(isTRUE(alive)){
+        inla_status("INLA is already running. Cancel the current run before starting another one.")
+        return()
+      }
+    }
+
+    if(!requireNamespace("INLA",quietly=TRUE)){
+      inla_state("error")
+      inla_status("INLA is not installed. Run source('install_inla.R') once, restart R, then try again.")
+      return()
+    }
+    if(!requireNamespace("rmarkdown",quietly=TRUE)){
+      inla_state("error")
+      inla_status("Package 'rmarkdown' is not installed. Run source('install_packages.R') first.")
+      return()
+    }
+    if(!requireNamespace("callr",quietly=TRUE)){
+      inla_state("error")
+      inla_status("Package 'callr' is not installed. Run source('install_packages.R') first.")
+      return()
+    }
+
+    dir.create(file.path("data","derived"),showWarnings=FALSE,recursive=TRUE)
+
+    # Prevent stale diagnostics from being mistaken for the current run.
+    if(file.exists(live_diag_path)) unlink(live_diag_path)
+    if(file.exists(live_screening_path)) unlink(live_screening_path)
+    if(file.exists(inla_log_path)) unlink(inla_log_path)
+    if(file.exists(inla_err_path)) unlink(inla_err_path)
+
+    inla_metrics(NULL)
+    inla_state("running")
+    inla_started_at(Sys.time())
+    inla_status("Starting a separate R process for the full INLA/SPDE workflow...")
+
+    project_dir <- normalizePath(".",winslash="/",mustWork=TRUE)
+    rmd_file <- normalizePath(
+      file.path("analysis","Lembang_IJGI_Reproducible_Analysis.Rmd"),
+      winslash="/",
+      mustWork=TRUE
+    )
+    raw_dir <- normalizePath(
+      file.path("data","raw"),
+      winslash="/",
+      mustWork=TRUE
+    )
+    log_file <- normalizePath(
+      file.path("data","derived"),
+      winslash="/",
+      mustWork=TRUE
+    )
+    log_file <- file.path(log_file,"inla_run.log")
+    err_file <- file.path(dirname(log_file),"inla_error.log")
+
+    parent_libpaths <- .libPaths()
+
+    proc <- tryCatch(
+      callr::r_bg(
+        func=function(project_dir,rmd_file,raw_dir,parent_libpaths){
+          setwd(project_dir)
+          .libPaths(unique(c(parent_libpaths,.libPaths())))
+          options(warn=1)
+
+          cat("Background R version:",R.version.string,"\n")
+          cat("Library paths:\n",paste(.libPaths(),collapse="\n"),"\n")
+          cat("INLA available:",requireNamespace("INLA",quietly=TRUE),"\n")
+          cat("rmarkdown available:",requireNamespace("rmarkdown",quietly=TRUE),"\n")
+          cat("Starting manuscript computation without Pandoc conversion...\n")
+
+          # run_pandoc=FALSE executes all R Markdown chunks but avoids a
+          # separate document-conversion failure after the scientific results
+          # have already been produced.
+          rmarkdown::render(
+            input=rmd_file,
+            output_format="html_document",
+            params=list(data_dir=raw_dir),
+            envir=new.env(parent=globalenv()),
+            quiet=FALSE,
+            clean=FALSE,
+            run_pandoc=FALSE
+          )
+
+          cat("R Markdown computation finished.\n")
+          sync_script <- file.path(project_dir,"scripts","sync_manuscript.py")
+          py <- Sys.which("python3"); if(!nzchar(py)) py <- Sys.which("python")
+          if(file.exists(sync_script) && nzchar(py)){
+            cat("Synchronizing manuscript from regenerated outputs...\n")
+            sync_status <- tryCatch(system2(py,c(sync_script),stdout=TRUE,stderr=TRUE),error=function(e) paste("SYNC ERROR:",conditionMessage(e)))
+            cat(paste(sync_status,collapse="\n"),"\n")
+          } else {
+            cat("Manuscript auto-sync skipped: Python or sync script not available.\n")
+          }
+          invisible(TRUE)
+        },
+        args=list(
+          project_dir=project_dir,
+          rmd_file=rmd_file,
+          raw_dir=raw_dir,
+          parent_libpaths=parent_libpaths
+        ),
+        libpath=parent_libpaths,
+        stdout=log_file,
+        stderr=err_file,
+        supervise=TRUE
+      ),
+      error=function(e) e
+    )
+
+    if(inherits(proc,"error")){
+      inla_state("error")
+      inla_status(paste("Could not start the INLA background process:",conditionMessage(proc)))
+      inla_process(NULL)
+      return()
+    }
+
+    inla_process(proc)
+    inla_pid(tryCatch(proc$get_pid(),error=function(e) NA_integer_))
+    inla_status(
+      paste0(
+        "INLA is running in a background R process",
+        if(is.finite(inla_pid())) paste0(" (PID ",inla_pid(),")") else "",
+        ". You can continue using the dashboard."
+      )
+    )
+  })
+
+  observeEvent(input$cancel_inla,{
+    proc <- inla_process()
+    if(is.null(proc)){
+      inla_status("There is no active INLA process to cancel.")
+      return()
+    }
+    alive <- tryCatch(proc$is_alive(),error=function(e) FALSE)
+    if(isTRUE(alive)){
+      try(proc$kill(),silent=TRUE)
+      inla_state("cancelled")
+      inla_status("INLA run was cancelled by the user.")
+    } else {
+      inla_status("The INLA process is no longer running.")
+    }
+  })
+
+  inla_poll <- reactiveTimer(1000,session)
+
+  observe({
+    inla_poll()
+    req(identical(inla_state(),"running"))
+
+    proc <- inla_process()
+    if(is.null(proc)) return()
+
+    alive <- tryCatch(proc$is_alive(),error=function(e) FALSE)
+    elapsed_sec <- if(!is.null(inla_started_at())){
+      as.numeric(difftime(Sys.time(),inla_started_at(),units="secs"))
+    } else 0
+
+    if(isTRUE(alive)){
+      elapsed_txt <- if(elapsed_sec < 60){
+        paste0(round(elapsed_sec)," s")
+      } else {
+        paste0(round(elapsed_sec/60,1)," min")
+      }
+      inla_status(
+        paste0(
+          "INLA is RUNNING",
+          if(is.finite(inla_pid())) paste0(" (PID ",inla_pid(),")") else "",
+          " · elapsed ",elapsed_txt,
+          ". The dashboard remains responsive."
+        )
+      )
+      return()
+    }
+
+    exit_status <- tryCatch(proc$get_exit_status(),error=function(e) NA_integer_)
+
+    # Scientific success is determined from the generated diagnostic file,
+    # not only from the child process exit code. A later report-formatting
+    # failure must not discard an already completed INLA fit.
+    if(file.exists(live_diag_path)){
+      new_metrics <- tryCatch(
+        readr::read_csv(live_diag_path,show_col_types=FALSE),
+        error=function(e) NULL
+      )
+
+      if(!is.null(new_metrics) && nrow(new_metrics)>0){
+        inla_metrics(new_metrics)
+        elapsed_min <- round(elapsed_sec/60,1)
+
+        if(identical(exit_status,0L)){
+          inla_state("done")
+          inla_status(
+            paste0(
+              "INLA completed successfully",
+              if(is.finite(elapsed_min)) paste0(" in ",elapsed_min," min") else "",
+              ". Diagnostics and manuscript-derived map layers were refreshed."
+            )
+          )
+        } else {
+          inla_state("done_warning")
+          inla_status(
+            paste0(
+              "The core INLA models completed and diagnostics were recovered",
+              if(is.finite(elapsed_min)) paste0(" after ",elapsed_min," min") else "",
+              ". The background report process later returned exit status ",
+              ifelse(is.na(exit_status),"unknown",exit_status),
+              ". Results are available; see the log for the post-processing warning."
+            )
+          )
+        }
+        return()
+      }
+    }
+
+    inla_state("error")
+    inla_status(
+      paste0(
+        "INLA stopped before producing diagnostics (exit status ",
+        ifelse(is.na(exit_status),"unknown",exit_status),
+        "). ",
+        inla_error_summary(5)
+      )
+    )
+  })
+
+  output$inla_progress_ui <- renderUI({
+    inla_poll()
+    st <- inla_state()
+
+    if(identical(st,"running")){
+      elapsed_sec <- if(!is.null(inla_started_at())){
+        as.numeric(difftime(Sys.time(),inla_started_at(),units="secs"))
+      } else 0
+      elapsed_txt <- if(elapsed_sec < 60){
+        paste0(round(elapsed_sec)," seconds")
+      } else {
+        paste0(round(elapsed_sec/60,1)," minutes")
+      }
+
+      div(
+        class="inla-progress-wrap",
+        div(
+          class="inla-status-row",
+          span(class="status-dot running-dot"),
+          strong("INLA IS RUNNING"),
+          span(class="inla-elapsed",paste0(" · ",elapsed_txt))
+        ),
+        div(
+          class="inla-progress-track",
+          div(class="inla-progress-bar inla-progress-animated")
+        ),
+        div(
+          class="small text-muted mt-1",
+          "Background process is active. Progress is indeterminate because INLA runtime depends on model complexity and convergence."
+        )
+      )
+    } else if(identical(st,"done")){
+      div(
+        class="inla-status-row",
+        span(class="status-dot done-dot"),
+        strong("INLA COMPLETED")
+      )
+    } else if(identical(st,"done_warning")){
+      div(
+        class="inla-status-row",
+        span(class="status-dot done-dot"),
+        strong("INLA COMPLETED — REPORT WARNING")
+      )
+    } else if(identical(st,"cancelled")){
+      div(
+        class="inla-status-row",
+        span(class="status-dot idle-dot"),
+        strong("INLA CANCELLED")
+      )
+    } else if(identical(st,"error")){
+      div(
+        class="inla-status-row",
+        span(class="status-dot error-dot"),
+        strong("INLA ERROR")
+      )
+    } else {
+      div(
+        class="inla-status-row",
+        span(class="status-dot idle-dot"),
+        strong("INLA NOT STARTED")
+      )
+    }
+  })
+
+  output$inla_run_status <- renderUI({
+    st <- inla_state()
+    if(identical(st,"error")){
+      div(
+        class="note-box",
+        strong("INLA error"),
+        tags$p(inla_status()),
+        tags$pre(
+          style="white-space:pre-wrap;max-height:220px;overflow:auto;margin-top:8px;",
+          inla_error_summary(8)
+        )
+      )
+    } else {
+      div(class="note-box",inla_status())
+    }
+  })
+
+  output$inla_log_tail <- renderText({
+    inla_poll()
+    tail_inla_log(18)
+  })
+
+  output$inla_ready <- reactive(!is.null(inla_metrics()))
+  outputOptions(output,"inla_ready",suspendWhenHidden=FALSE)
+
+  output$inla_gate <- renderUI({
+    if(is.null(inla_metrics())){
+      div(
+        class="inla-empty-state",
+        icon("chart-line"),
+        h4("No diagnostics from a completed INLA run yet"),
+        p("Use 'Run Full INLA Workflow' above. While it is running, the status indicator and log update in this tab.")
+      )
+    } else {
+      div(
+        class="note-box",
+        "Live diagnostics are available from the most recent completed INLA run."
+      )
+    }
+  })
+
+  output$inla_live_table <- renderDT({
+    req(inla_metrics())
+    datatable(
+      inla_metrics(),
+      rownames=FALSE,
+      options=list(dom="t",scrollX=TRUE)
+    )
+  })
+
+  output$inla_metric_plot <- renderPlotly({
+    d <- inla_metrics()
+    req(d)
+
+    blank_plotly <- function(msg){
+      plot_ly() %>%
+        layout(
+          paper_bgcolor="rgba(0,0,0,0)",
+          plot_bgcolor="rgba(0,0,0,0)",
+          font=list(color=axis_color()),
+          xaxis=list(visible=FALSE),
+          yaxis=list(visible=FALSE),
+          annotations=list(list(
+            text=msg,
+            x=.5,y=.5,
+            xref="paper",yref="paper",
+            showarrow=FALSE,
+            font=list(size=15,color=axis_color())
+          )),
+          margin=list(l=20,r=20,t=20,b=20)
+        )
+    }
+
+    d <- as.data.frame(d)
+
+    # Detect DIC/WAIC case-insensitively because exported diagnostics may
+    # use DIC/WAIC, dic/waic, or mixed-case names.
+    nms <- names(d)
+    metric_idx <- which(toupper(nms) %in% c("DIC","WAIC"))
+
+    if(!length(metric_idx)){
+      return(blank_plotly(
+        "DIC and WAIC are not available in the current completed diagnostics."
+      ))
+    }
+
+    metric_cols <- nms[metric_idx]
+
+    # Model label is also detected case-insensitively. If absent, generate
+    # a stable row label rather than failing the plot.
+    model_idx <- which(tolower(nms)=="model")
+    if(length(model_idx)){
+      d$Model_display <- as.character(d[[model_idx[1]]])
+    } else {
+      d$Model_display <- paste0("Model ",seq_len(nrow(d)))
+    }
+
+    for(nm in metric_cols){
+      d[[nm]] <- suppressWarnings(as.numeric(d[[nm]]))
+    }
+
+    long <- tidyr::pivot_longer(
+      d,
+      cols=all_of(metric_cols),
+      names_to="metric",
+      values_to="value"
+    ) %>%
+      dplyr::mutate(metric=toupper(metric)) %>%
+      dplyr::filter(is.finite(value))
+
+    if(!nrow(long)){
+      return(blank_plotly(
+        "DIC/WAIC columns were found, but they contain no finite numeric values."
+      ))
+    }
+
+    p <- ggplot(long,aes(x=Model_display,y=value,fill=metric))+
+      geom_col(position="dodge",width=.7,na.rm=TRUE)+
+      scale_fill_manual(
+        values=unname(c("#27B7FF","#2AD4C9")),
+        breaks=c("DIC","WAIC")
+      )+
+      labs(x=NULL,y="Criterion",fill=NULL)+
+      transparent_theme()
+
+    plotly_transparent(p)
+  })
+
+  # -------- BAYESIAN HAZARD & SCREENING --------
+  posterior_year_path <- file.path("data","derived","posterior_exceedance_year_live.csv")
+  posterior_summary_path <- file.path("data","derived","posterior_exceedance_summary_live.csv")
+  posterior_highres_path <- file.path("data","derived","posterior_spde_highres_live.csv")
+
+  posterior_year_data <- reactive({
+    if(!file.exists(posterior_year_path)) return(NULL)
+    tryCatch(
+      readr::read_csv(posterior_year_path,show_col_types=FALSE),
+      error=function(e) NULL
+    )
+  })
+
+  posterior_summary_data <- reactive({
+    if(!file.exists(posterior_summary_path)) return(NULL)
+    tryCatch(
+      readr::read_csv(posterior_summary_path,show_col_types=FALSE),
+      error=function(e) NULL
+    )
+  })
+
+  posterior_highres_data <- reactive({
+    if(!file.exists(posterior_highres_path)) return(NULL)
+    tryCatch(
+      readr::read_csv(posterior_highres_path,show_col_types=FALSE),
+      error=function(e) NULL
+    )
+  })
+
+  output$bayes_map_title <- renderText({
+    switch(
+      input$bayes_map_product,
+      posterior_avg="Posterior Smoothed Exceedance Fraction — District Average",
+      posterior_year=paste("Posterior Smoothed Exceedance Fraction —",input$bayes_year),
+      posterior_uncertainty="Posterior Uncertainty — Mean 95% Credible-Interval Width",
+      posterior_highres="High-Resolution SPDE Posterior Screening Surface",
+      screening="Integrated Relative Seismic Screening Score"
+    )
+  })
+
+  output$bayes_map <- renderLeaflet({
+    m <- leaflet(options=leafletOptions(preferCanvas=TRUE,minZoom=5)) %>%
+      add_basemap(input$bayes_basemap)
+
+    fault <- get_fault()
+    d <- get_districts()
+
+    m <- m %>%
+      addPolylines(data=fault,color="#FF3B30",weight=5,opacity=.95)
+
+    product <- input$bayes_map_product
+
+    if(product=="posterior_highres"){
+      hr <- posterior_highres_data()
+      if(is.null(hr) || !nrow(hr)){
+        return(
+          m %>%
+            addPolygons(data=d,fill=FALSE,color="#8EA9B9",weight=.6) %>%
+            addControl(
+              html="<div class='map-empty-note'><b>High-resolution SPDE surface not available.</b><br>Run the Full INLA Workflow in INLA Diagnostics.</div>",
+              position="topright"
+            )
+        )
+      }
+
+      pal <- colorNumeric(
+        c("#081D58","#225EA8","#41B6C4","#FDE725"),
+        domain=hr$posterior_exceedance_hr,
+        na.color="#46525C"
+      )
+
+      m <- m %>%
+        addCircleMarkers(
+          data=hr,
+          lng=~longitude,
+          lat=~latitude,
+          radius=3,
+          stroke=FALSE,
+          fillOpacity=.78,
+          color=~pal(posterior_exceedance_hr),
+          popup=~paste0(
+            "<b>SPDE posterior screening surface</b><br>",
+            "Posterior exceedance: ",format(posterior_exceedance_hr,scientific=TRUE,digits=4)
+          )
+        ) %>%
+        addPolygons(data=d,fill=FALSE,color="#E3EEF4",weight=.45,opacity=.75) %>%
+        addLegend(
+          "bottomright",
+          pal=pal,
+          values=hr$posterior_exceedance_hr,
+          title="Posterior exceedance"
+        )
+
+      bb <- sf::st_bbox(d)
+      return(m %>% fitBounds(
+        as.numeric(bb["xmin"]),as.numeric(bb["ymin"]),
+        as.numeric(bb["xmax"]),as.numeric(bb["ymax"])
+      ))
+    }
+
+    if(product=="screening"){
+      if(!file.exists(live_screening_path)){
+        return(
+          m %>% addPolygons(data=d,fill=FALSE,color="#8EA9B9",weight=.6) %>%
+            addControl(
+              html="<div class='map-empty-note'><b>Screening output not available.</b><br>Run the Full INLA Workflow.</div>",
+              position="topright"
+            )
+        )
+      }
+
+      dd <- readr::read_csv(live_screening_path,show_col_types=FALSE)
+      dd$key <- paste(clean_key(dd$kabupaten),clean_key(dd$kecamatan),sep="__")
+      p <- dplyr::left_join(d,dd,by="key")
+      vals <- p$Screening_Score
+
+      pal <- colorNumeric(
+        c("#081D58","#225EA8","#41B6C4","#FDE725"),
+        domain=vals,
+        na.color="#46525C"
+      )
+
+      bb <- sf::st_bbox(p)
+      return(
+        m %>%
+          addPolygons(
+            data=p,
+            fillColor=pal(vals),
+            fillOpacity=.78,
+            color="#D9E7EF",
+            weight=.65,
+            popup=paste0(
+              "<b>",p$kabupaten_kota," — ",p$kecamatan,"</b><br>",
+              "Screening score: ",sprintf("%.2f",vals)
+            )
+          ) %>%
+          addLegend("bottomright",pal=pal,values=vals,title="Screening score") %>%
+          fitBounds(
+            as.numeric(bb["xmin"]),as.numeric(bb["ymin"]),
+            as.numeric(bb["xmax"]),as.numeric(bb["ymax"])
+          )
+      )
+    }
+
+    if(product=="posterior_year"){
+      dd <- posterior_year_data()
+      if(is.null(dd)) return(
+        m %>% addPolygons(data=d,fill=FALSE,color="#8EA9B9",weight=.6) %>%
+          addControl(
+            html="<div class='map-empty-note'><b>Posterior output not available.</b><br>Run the Full INLA Workflow.</div>",
+            position="topright"
+          )
+      )
+      dd <- dd %>% filter(Tahun==input$bayes_year)
+      var <- "posterior_exceedance"
+      title <- paste("Posterior exceedance",input$bayes_year)
+    } else {
+      dd <- posterior_summary_data()
+      if(is.null(dd)) return(
+        m %>% addPolygons(data=d,fill=FALSE,color="#8EA9B9",weight=.6) %>%
+          addControl(
+            html="<div class='map-empty-note'><b>Posterior output not available.</b><br>Run the Full INLA Workflow.</div>",
+            position="topright"
+          )
+      )
+      if(product=="posterior_uncertainty"){
+        var <- "ci_width_avg"
+        title <- "Mean 95% CI width"
+      } else {
+        var <- "p_mean_avg"
+        title <- "Posterior exceedance"
+      }
+    }
+
+    dd$key <- paste(clean_key(dd$kabupaten),clean_key(dd$kecamatan),sep="__")
+    p <- dplyr::left_join(d,dd,by="key")
+    vals <- suppressWarnings(as.numeric(p[[var]]))
+
+    pal <- colorNumeric(
+      c("#081D58","#225EA8","#41B6C4","#FDE725"),
+      domain=vals,
+      na.color="#46525C"
+    )
+
+    bb <- sf::st_bbox(p)
+    m %>%
+      addPolygons(
+        data=p,
+        fillColor=pal(vals),
+        fillOpacity=.80,
+        color="#D9E7EF",
+        weight=.65,
+        popup=paste0(
+          "<b>",p$kabupaten_kota," — ",p$kecamatan,"</b><br>",
+          title,": ",
+          ifelse(is.na(vals),"NA",format(vals,scientific=TRUE,digits=4))
+        )
+      ) %>%
+      addLegend("bottomright",pal=pal,values=vals,title=title) %>%
+      fitBounds(
+        as.numeric(bb["xmin"]),as.numeric(bb["ymin"]),
+        as.numeric(bb["xmax"]),as.numeric(bb["ymax"])
+      )
+  })
+
+  output$bayes_summary_ui <- renderUI({
+    dd <- posterior_summary_data()
+    if(is.null(dd)){
+      return(div(
+        class="note-box",
+        "Run the Full INLA Workflow first. Posterior maps are generated from the completed full spatial-temporal model."
+      ))
+    }
+
+    vals <- suppressWarnings(as.numeric(dd$p_mean_avg))
+    vals <- vals[is.finite(vals)]
+    if(!length(vals)) return(div(class="note-box","No finite posterior values are available."))
+
+    tagList(
+      div(class="note-box",
+          tags$b("Paper quantity: "),
+          "district-level posterior fitted exceedance-screening probability, averaged over model years."),
+      tags$ul(
+        tags$li(paste0("Median: ",format(stats::median(vals),scientific=TRUE,digits=4))),
+        tags$li(paste0("Maximum: ",format(max(vals),scientific=TRUE,digits=4))),
+        tags$li(paste0("Minimum: ",format(min(vals),scientific=TRUE,digits=4))),
+        tags$li("Values may round to 0.000 at three decimals; use scientific notation to inspect spatial differences.")
+      )
+    )
+  })
+
+  output$bayes_top_table <- renderDT({
+    dd <- posterior_summary_data()
+    req(dd)
+    z <- dd %>%
+      arrange(desc(p_mean_avg)) %>%
+      transmute(
+        Regency=kabupaten,
+        District=kecamatan,
+        Posterior_Exceedance=p_mean_avg,
+        CI_Width=ci_width_avg
+      ) %>%
+      slice_head(n=12)
+
+    datatable(z,rownames=FALSE,options=list(dom="t",scrollX=TRUE)) %>%
+      formatSignif(c("Posterior_Exceedance","CI_Width"),4)
+  })
+
+  output$bayes_year_plot <- renderPlotly({
+    dd <- posterior_year_data()
+    req(dd)
+
+    z <- dd %>%
+      group_by(Tahun) %>%
+      summarise(
+        median=median(posterior_exceedance,na.rm=TRUE),
+        q25=quantile(posterior_exceedance,.25,na.rm=TRUE),
+        q75=quantile(posterior_exceedance,.75,na.rm=TRUE),
+        .groups="drop"
+      )
+
+    p <- ggplot(z,aes(Tahun,median))+
+      geom_ribbon(aes(ymin=q25,ymax=q75),alpha=.20)+
+      geom_line(linewidth=1.1,color="#27B7FF")+
+      geom_point(size=2.5,color="#2AD4C9")+
+      scale_y_continuous(labels=scales::label_scientific())+
+      labs(x="Year",y="Posterior smoothed exceedance fraction")+
+      transparent_theme()
+
+    plotly_transparent(p)
+  })
+
+  output$bayes_uncertainty_plot <- renderPlotly({
+    dd <- posterior_summary_data()
+    req(dd)
+
+    z <- dd %>%
+      filter(is.finite(p_mean_avg),is.finite(ci_width_avg))
+
+    p <- ggplot(z,aes(p_mean_avg,ci_width_avg))+
+      geom_point(alpha=.65,color="#27B7FF")+
+      scale_x_continuous(labels=scales::label_scientific())+
+      scale_y_continuous(labels=scales::label_scientific())+
+      labs(
+        x="Mean posterior exceedance",
+        y="Mean 95% credible-interval width"
+      )+
+      transparent_theme()
+
+    plotly_transparent(p)
+  })
+
+  # -------- PAPER-SYNCHRONIZED RANKING / SENSITIVITY --------
+  top10_live_path <- file.path("data","derived","top10_screening_live.csv")
+  sensitivity_live_path <- file.path("data","derived","sensitivity_analysis_live.csv")
+
+  live_top10 <- reactive({
+    if(!file.exists(top10_live_path)) return(NULL)
+    tryCatch(readr::read_csv(top10_live_path,show_col_types=FALSE),error=function(e) NULL)
+  })
+
+  live_sensitivity <- reactive({
+    if(!file.exists(sensitivity_live_path)) return(NULL)
+    tryCatch(readr::read_csv(sensitivity_live_path,show_col_types=FALSE),error=function(e) NULL)
+  })
+
+  ranking_filtered <- reactive({
+    d <- live_top10()
+    req(d)
+    n <- min(input$top_n,nrow(d))
+    d %>% arrange(Rank) %>% slice_head(n=n)
+  })
+
+  output$ranking_plot <- renderPlot({
+    d <- live_top10()
+    if(is.null(d)){
+      plot.new(); text(.5,.5,"Run the Full INLA Workflow to generate paper-synchronized ranking results.",cex=1.1)
+      return(invisible())
+    }
+    d <- ranking_filtered()
+    ggplot(d,aes(x=reorder(kecamatan,Screening_Score),y=Screening_Score))+
+      geom_col(fill="#27B7FF",width=.72)+coord_flip()+
+      labs(x=NULL,y="Screening score")+transparent_theme()
+  },res=120,bg="transparent")
+
+  output$ranking_table <- renderDT({
+    d <- live_top10()
+    if(is.null(d)){
+      return(datatable(
+        data.frame(Status="Run the Full INLA Workflow to generate manuscript-ready ranking results."),
+        rownames=FALSE,options=list(dom="t")
+      ))
+    }
+    datatable(ranking_filtered(),rownames=FALSE,options=list(scrollX=TRUE,pageLength=10)) |>
+      formatRound(c("Screening_Score","p_mean_avg"),6)
+  })
+
+  sensitivity_filtered <- reactive({
+    d <- live_sensitivity()
+    req(d)
+    d %>% filter(sensitivity_factor==input$sens_factor)
+  })
+
+  observe({
+    d <- live_sensitivity()
+    if(!is.null(d) && nrow(d)){
+      updateSelectInput(session,"sens_factor",choices=unique(d$sensitivity_factor),selected=unique(d$sensitivity_factor)[1])
+    }
+  })
+
+  output$sensitivity_plot <- renderPlot({
+    d0 <- live_sensitivity()
+    if(is.null(d0)){
+      plot.new(); text(.5,.5,"Run the Full INLA Workflow to regenerate sensitivity analysis under the aligned vulnerability definition.",cex=1.0)
+      return(invisible())
+    }
+    d <- sensitivity_filtered() %>% mutate(setting=factor(setting,levels=rev(setting)))
+    ggplot(d,aes(spearman_rho,setting))+
+      geom_segment(aes(x=0,xend=spearman_rho,yend=setting),linewidth=2.8,color="#35566A")+
+      geom_point(size=4,color="#2AD4C9")+
+      labs(x="Spearman rho",y=NULL)+transparent_theme()
+  },res=120,bg="transparent")
+
+  output$sensitivity_table <- renderDT({
+    d <- live_sensitivity()
+    if(is.null(d)){
+      return(datatable(
+        data.frame(Status="Run the Full INLA Workflow to generate manuscript-ready sensitivity results."),
+        rownames=FALSE,options=list(dom="t")
+      ))
+    }
+    datatable(sensitivity_filtered(),rownames=FALSE,options=list(dom="t",scrollX=TRUE))
+  })
+
+  output$methods_table <- renderUI({
+    table_ui(c(
+      "Common support"="227 districts (kecamatan)",
+      "Exposure indicators"="Population density, health facilities, education facilities",
+      "Vulnerability indicator"="2024 inverse BPS Sinyal/connectivity screening proxy",
+      "Bayesian layer"="INLA latent Gaussian model",
+      "Spatial structure"="Matérn SPDE",
+      "Temporal structure"="RW1",
+      "Baseline weighting"="60% shaking, 30% exposure, 10% vulnerability"
+    ))
+  })
+
+  dl <- function(data,filename)
+    downloadHandler(filename=function()filename,content=function(file)readr::write_csv(data,file))
+  output$download_top10 <- downloadHandler(
+    filename=function() "top10_screening_live.csv",
+    content=function(file){
+      d <- live_top10(); validate(need(!is.null(d),"Run Full INLA Workflow first.")); readr::write_csv(d,file)
+    }
+  )
+  output$download_top10_2 <- downloadHandler(
+    filename=function() "top10_screening_live.csv",
+    content=function(file){
+      d <- live_top10(); validate(need(!is.null(d),"Run Full INLA Workflow first.")); readr::write_csv(d,file)
+    }
+  )
+  output$download_sensitivity <- downloadHandler(
+    filename=function() "sensitivity_analysis_live.csv",
+    content=function(file){
+      d <- live_sensitivity(); validate(need(!is.null(d),"Run Full INLA Workflow first.")); readr::write_csv(d,file)
+    }
+  )
+  output$download_models <- dl(models,"reported_model_comparison.csv")
+  manuscript_dir_live <- file.path("data","manuscript")
+  synced_paper_live <- file.path(manuscript_dir_live,"Lembang_IJGI_FINAL_SYNCED.docx")
+  output$download_synced_paper <- downloadHandler(filename=function() "Lembang_IJGI_FINAL_SYNCED.docx",content=function(file){validate(need(file.exists(synced_paper_live),"Run Full INLA Workflow first."));file.copy(synced_paper_live,file,overwrite=TRUE)})
+  output$download_manuscript_bundle <- downloadHandler(filename=function() "Lembang_IJGI_Manuscript_Outputs.zip",content=function(file){validate(need(dir.exists(manuscript_dir_live),"Run Full INLA Workflow first.")); candidates <- list.files(manuscript_dir_live,full.names=TRUE,pattern="\\.(csv|png|txt|docx)$",ignore.case=TRUE); validate(need(length(candidates)>0,"No manuscript outputs are available yet.")); oldwd<-getwd(); on.exit(setwd(oldwd),add=TRUE); setwd(manuscript_dir_live); utils::zip(zipfile=normalizePath(file,mustWork=FALSE),files=basename(candidates),flags="-r9X")})
+}
+
+shinyApp(ui,server)
