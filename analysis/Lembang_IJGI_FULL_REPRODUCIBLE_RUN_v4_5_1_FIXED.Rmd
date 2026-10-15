@@ -1,0 +1,999 @@
+---
+title: "Bayesian Geo-Information Screening of Seismic Shaking, Exposure, and Vulnerability in the Lembang Fault Region"
+author: "Reproducible analysis companion"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+  word_document:
+    toc: true
+params:
+  data_dir: null
+  n_eff: 3
+  pga_threshold_g: 0.092
+  scenario_mw: 6.8
+  pc_range_km: 20
+  pc_sigma: 1.5
+---
+
+# Purpose
+
+This R Markdown file is the reproducible analytical companion to the manuscript targeted to *ISPRS International Journal of Geo-Information*. The workflow is intentionally framed as district-level geo-information screening. It does **not** fit an ETAS model, estimate earthquake triggering, or produce short-horizon event-count forecasts. Instead, it harmonizes earthquake-source information, fault geometry, Vs30, administrative units, and annual exposure-vulnerability attributes; constructs a GMPE-derived shaking-exceedance proxy; smooths that proxy with an INLA-SPDE latent Gaussian model; and evaluates the stability of an integrated spatial screening score.
+
+**Vulnerability-data revision.** The bundled BPS file does not contain district-level age-group counts or a road-damage variable. To avoid inventing unsupported inputs, the vulnerability component is anchored to an auditable 2024 connectivity proxy derived from the observed `Sinyal` indicator. The proxy is scaled so that lower 2024 connectivity corresponds to higher relative vulnerability. It is a screening proxy, not a demographic vulnerable-age ratio, road-damage measure, or physical-loss estimate. Exposure continues to use the 2019--2025 socioeconomic panel, while vulnerability is anchored to 2024.
+
+```{r setup, message=FALSE, warning=FALSE}
+options(stringsAsFactors = FALSE)
+set.seed(2025)
+
+required_packages <- c(
+  "sf", "dplyr", "tidyr", "zoo", "psych", "ggplot2", "viridis",
+  "patchwork", "ggrepel", "knitr", "purrr", "readr", "tibble",
+  "scales", "INLA"
+)
+
+missing_pkgs <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_pkgs)) {
+  stop("Install required packages before knitting: ", paste(missing_pkgs, collapse = ", "))
+}
+
+library(sf)
+library(dplyr)
+library(tidyr)
+library(zoo)
+library(psych)
+library(ggplot2)
+library(viridis)
+library(patchwork)
+library(ggrepel)
+library(knitr)
+library(purrr)
+library(readr)
+library(tibble)
+library(scales)
+library(INLA)
+
+# Resolve the bundled raw-data directory automatically.
+# This makes the Rmd runnable both from the project root and from analysis/.
+param_data_dir <- params$data_dir
+if (is.null(param_data_dir) || length(param_data_dir) != 1L || is.na(param_data_dir)) {
+  param_data_dir <- ""
+}
+
+data_candidates <- unique(c(
+  param_data_dir,
+  file.path("data","raw"),
+  file.path("..","data","raw"),
+  "Data"
+))
+data_candidates <- data_candidates[!is.na(data_candidates) & nzchar(data_candidates)]
+existing_data_dirs <- data_candidates[dir.exists(data_candidates)]
+
+if (!length(existing_data_dirs)) {
+  stop(
+    "Raw-data directory not found. Expected one of: ",
+    paste(data_candidates, collapse=", "),
+    ". Keep this Rmd inside the Shiny project or pass params$data_dir explicitly."
+  )
+}
+DATA_DIR <- normalizePath(existing_data_dirs[1], mustWork=TRUE)
+cat("Using raw-data directory:", DATA_DIR, "\n")
+
+file_bps   <- file.path(DATA_DIR, "Data BPS.csv")
+file_vs30  <- file.path(DATA_DIR, "DATA_VS30_LENGKAP.csv")
+file_eq    <- file.path(DATA_DIR, "BMKG_Earthquake_Catalog.csv")
+file_gpkg  <- file.path(DATA_DIR, "Batas_Desa_Kelurahan_JABAR.gpkg")
+file_fault <- file.path(DATA_DIR, "titik_sesar_lembang.kmz")
+
+for (f in c(file_bps, file_vs30, file_eq, file_gpkg, file_fault)) {
+  if (!file.exists(f)) stop("Missing file: ", f)
+}
+
+CFG <- list(
+  hazard_start = 2009,
+  hazard_end = 2024,
+  exp_start = 2019,
+  exp_end = 2025,
+  model_years = 2019:2025,
+  n_eff = params$n_eff,
+  pga_threshold = params$pga_threshold_g,
+  scenario_mw = params$scenario_mw,
+  pc_range_km = params$pc_range_km,
+  pc_sigma = params$pc_sigma,
+  pc_prob = 0.05,
+  utm_crs = 32748,
+  gmpe = list(
+    c0=-0.53804, c1=0.59850, c2=-0.01218,
+    c3=-1.30709, c4=0.10648, Mh=6.0,
+    Rref=1.0, c7=-0.36, Vref=760,
+    sigma=0.55, V1=225, V2=300, b1=-0.7, b2=-0.1
+  )
+)
+
+normalize01 <- function(x) {
+  rr <- range(x, na.rm=TRUE)
+  if (!all(is.finite(rr)) || diff(rr) == 0) return(rep(0, length(x)))
+  (x - rr[1]) / diff(rr)
+}
+
+rank_stability <- function(base_df, alt_df, id="ID_Kec") {
+  z <- inner_join(
+    base_df %>% select(all_of(id), Rank_base=Rank),
+    alt_df %>% select(all_of(id), Rank_alt=Rank), by=id
+  )
+  rho <- cor(z$Rank_base, z$Rank_alt, method="spearman", use="complete.obs")
+  topn <- min(10, nrow(z))
+  a <- z %>% arrange(Rank_base) %>% slice_head(n=topn) %>% pull(all_of(id))
+  b <- z %>% arrange(Rank_alt) %>% slice_head(n=topn) %>% pull(all_of(id))
+  list(spearman=rho, top10_overlap=length(intersect(a,b))/topn)
+}
+```
+
+# Data inventory and audit
+
+```{r data-audit}
+bps_raw <- read.csv(file_bps, check.names=FALSE)
+vs30_raw <- read.csv(file_vs30, check.names=FALSE)
+eq_raw <- read.csv(file_eq, check.names=FALSE)
+
+# Numeric cleaning for BPS density values stored with thousands separators.
+if (is.character(bps_raw$Kepadatan)) {
+  bps_raw$Kepadatan <- as.numeric(gsub(",", "", bps_raw$Kepadatan, fixed=TRUE))
+}
+
+# Parse earthquake dates and harmonize column names used downstream.
+eq_raw$DateParsed <- as.Date(eq_raw$Date, tryFormats=c("%d-%b-%y", "%d-%b-%Y", "%Y-%m-%d"))
+eq_raw$Tahun <- as.integer(format(eq_raw$DateParsed, "%Y"))
+names(eq_raw)[names(eq_raw)=="Mag Type"] <- "Mag.Type"
+names(eq_raw)[names(eq_raw)=="Depth (km)"] <- "Depth"
+
+inventory <- tibble::tibble(
+  Dataset = c("BPS district-year", "USGS Vs30", "BMKG earthquake catalog"),
+  Rows = c(nrow(bps_raw), nrow(vs30_raw), nrow(eq_raw)),
+  Columns = c(ncol(bps_raw), ncol(vs30_raw), ncol(eq_raw))
+)
+kable(inventory)
+
+missing_bps <- bps_raw %>%
+  summarise(across(where(is.numeric), ~ mean(is.na(.)))) %>%
+  pivot_longer(everything(), names_to="Variable", values_to="MissingFraction")
+kable(missing_bps, digits=3)
+
+```
+
+# Spatial harmonization
+
+```{r spatial-harmonization, message=FALSE, warning=FALSE}
+# Administrative units
+layers <- st_layers(file_gpkg)$name
+layer_name <- if ("Batas_Desa_Kelurahan_JABAR" %in% layers) "Batas_Desa_Kelurahan_JABAR" else layers[1]
+desa_raw <- st_read(file_gpkg, layer=layer_name, quiet=TRUE) %>% st_zm(drop=TRUE, what="ZM") %>% st_make_valid()
+
+kode_target <- c("32.04","32.17","32.03","32.05","32.14","32.13","32.11","32.73","32.77")
+desa_study <- desa_raw %>% filter(kd_kab %in% kode_target)
+
+sf_use_s2(FALSE)
+# Province-wide kabupaten/kota context for background maps.
+jabar_kabkot_sf <- desa_raw %>%
+  group_by(kabupaten_kota) %>%
+  summarise(do_union=TRUE, .groups="drop") %>%
+  st_make_valid()
+
+# Dissolve village/kelurahan polygons to district level for the study area.
+# Do not hard-code the active geometry-column name (it can be `geom`,
+# `geometry`, or another name depending on the GeoPackage/GDAL build).
+kecamatan_sf <- desa_study %>%
+  group_by(kabupaten_kota, kecamatan) %>%
+  summarise(do_union=TRUE, .groups="drop") %>%
+  st_make_valid()
+
+# Outer outline of the study area, useful for context maps.
+study_area_outline <- kecamatan_sf %>%
+  summarise(do_union=TRUE, .groups="drop") %>%
+  st_make_valid()
+sf_use_s2(TRUE)
+kecamatan_sf$ID_Kec <- seq_len(nrow(kecamatan_sf))
+
+lookup_kec <- kecamatan_sf %>% st_drop_geometry() %>%
+  transmute(ID_Kec, kabupaten=kabupaten_kota, kecamatan)
+
+# Fault from KMZ
+read_fault_kmz <- function(path) {
+  td <- tempfile(); dir.create(td)
+  on.exit(unlink(td, recursive=TRUE), add=TRUE)
+  unzip(path, exdir=td)
+  kml <- list.files(td, pattern="\\.kml$", full.names=TRUE, recursive=TRUE)
+  if (!length(kml)) stop("No KML found inside KMZ")
+  st_read(kml[1], quiet=TRUE)
+}
+fault_sf <- read_fault_kmz(file_fault) %>% st_zm(drop=TRUE, what="ZM") %>% st_make_valid()
+fault_sf <- st_transform(fault_sf, st_crs(kecamatan_sf))
+
+# Metric CRS for distance-based operations.
+kecamatan_utm <- st_transform(kecamatan_sf, CFG$utm_crs)
+fault_utm <- st_transform(fault_sf, CFG$utm_crs)
+cent_utm <- st_centroid(kecamatan_utm)
+coords_utm <- st_coordinates(cent_utm)
+
+# Distance from district centroid to fault trace.
+kecamatan_sf$Distance_to_fault_km <- as.numeric(st_distance(cent_utm, fault_utm) |> apply(1, min)) / 1000
+
+# Vs30: retain physically meaningful (>0) grid cells, intersect with districts.
+vs30_pts <- vs30_raw %>%
+  filter(is.finite(longitude), is.finite(latitude), is.finite(vs30_mosaic), vs30_mosaic > 0) %>%
+  st_as_sf(coords=c("longitude","latitude"), crs=4326) %>%
+  st_transform(st_crs(kecamatan_sf))
+
+vs30_kec <- st_join(vs30_pts, kecamatan_sf %>% select(ID_Kec), join=st_within) %>%
+  st_drop_geometry() %>%
+  filter(!is.na(ID_Kec)) %>%
+  group_by(ID_Kec) %>%
+  summarise(Vs30_mean=mean(vs30_mosaic, na.rm=TRUE), Vs30_sd=sd(vs30_mosaic, na.rm=TRUE), n_grid=n(), .groups="drop")
+
+kecamatan_sf <- kecamatan_sf %>% left_join(vs30_kec, by="ID_Kec")
+
+# Spatial nearest-neighbor fill for districts without Vs30 intersections.
+vs <- kecamatan_sf$Vs30_mean
+missing_vs <- which(!is.finite(vs))
+if (length(missing_vs)) {
+  valid_vs <- which(is.finite(vs))
+  for (ii in missing_vs) {
+    dd <- sqrt((coords_utm[ii,1]-coords_utm[valid_vs,1])^2 + (coords_utm[ii,2]-coords_utm[valid_vs,2])^2)
+    jj <- order(dd)[seq_len(min(3, length(dd)))]
+    w <- (1/pmax(dd[jj],1)); w <- w/sum(w)
+    vs[ii] <- sum(vs[valid_vs[jj]]*w)
+  }
+}
+vs[vs < 100] <- 100
+kecamatan_sf$Vs30_model <- vs
+
+kable(tibble::tibble(
+  SpatialUnit="District (kecamatan)",
+  N=nrow(kecamatan_sf),
+  CRS_metric=CFG$utm_crs,
+  Missing_Vs30_filled=length(missing_vs)
+))
+```
+
+# Exposure and vulnerability panel
+
+```{r bps-panel}
+# Harmonize names used in administrative polygons.
+panel <- bps_raw %>%
+  rename(Kab.Kota=`Kab/Kota`) %>%
+  filter(Tahun >= CFG$exp_start, Tahun <= CFG$exp_end) %>%
+  mutate(
+    kabupaten = case_when(
+      Kab.Kota == "Kab. Bandung" ~ "Bandung",
+      Kab.Kota == "Kab. Bandung Barat" ~ "Bandung Barat",
+      Kab.Kota == "Kab. Cianjur" ~ "Cianjur",
+      Kab.Kota == "Kab. Garut" ~ "Garut",
+      Kab.Kota == "Kab. Purwakarta" ~ "Purwakarta",
+      Kab.Kota == "Kab. Subang" ~ "Subang",
+      Kab.Kota == "Kab. Sumedang" ~ "Sumedang",
+      Kab.Kota == "Kota Bandung" ~ "Kota Bandung",
+      Kab.Kota == "Kota Cimahi" ~ "Kota Cimahi",
+      TRUE ~ Kab.Kota
+    ),
+    kecamatan = case_when(
+      Kecamatan == "Cikalong Wetan" ~ "Cikalongwetan",
+      Kecamatan == "Blubur Limbangan" ~ "Bl. Limbangan",
+      Kecamatan == "Pondok Salam" ~ "Pondoksalam",
+      Kecamatan == "Tegal Waru" ~ "Tegalwaru",
+      Kecamatan == "Ujung Jaya" ~ "Ujungjaya",
+      Kecamatan == "Ujung Berung" ~ "Ujungberung",
+      Kecamatan == "Astanaanyar" ~ "Astana Anyar",
+      Kecamatan == "Solokan Jeruk" ~ "Solokanjeruk",
+      TRUE ~ Kecamatan
+    )
+  ) %>%
+  left_join(lookup_kec, by=c("kabupaten","kecamatan"))
+
+unmatched <- panel %>% filter(is.na(ID_Kec)) %>% distinct(Kab.Kota, Kecamatan)
+if (nrow(unmatched)) {
+  warning("Some BPS district names did not match the GPKG. Inspect object 'unmatched'.")
+}
+
+# Deterministic temporal interpolation used in the working analysis.
+impute_temporal <- function(x) {
+  if (all(is.na(x))) return(x)
+  zoo::na.locf(zoo::na.approx(x, na.rm=FALSE), na.rm=FALSE) |>
+    zoo::na.locf(fromLast=TRUE, na.rm=FALSE)
+}
+
+panel_imp <- panel %>%
+  arrange(ID_Kec, Tahun) %>%
+  group_by(ID_Kec) %>%
+  mutate(
+    Kepadatan = impute_temporal(Kepadatan),
+    Faskes = impute_temporal(Faskes),
+    Pendidikan = impute_temporal(Pendidikan),
+    Sinyal = impute_temporal(Sinyal)
+  ) %>%
+  ungroup()
+
+# Transform strongly skewed count/density variables.
+transform_if_skewed <- function(x, cutoff=1) {
+  s <- psych::skew(x, na.rm=TRUE)
+  if (is.finite(s) && abs(s) > cutoff && all(x >= 0, na.rm=TRUE)) log1p(x) else x
+}
+# Auditable 2024 vulnerability proxy from an actually observed BPS variable.
+# Lower Sinyal/connectivity -> higher relative vulnerability.
+inv_minmax <- function(x) {
+  x <- suppressWarnings(as.numeric(x))
+  good <- is.finite(x)
+  out <- rep(NA_real_, length(x))
+  if (!any(good)) return(out)
+  rng <- range(x[good], na.rm=TRUE)
+  if (!all(is.finite(rng)) || diff(rng)==0) {
+    out[good] <- 0.5
+  } else {
+    out[good] <- 1 - (x[good] - rng[1]) / diff(rng)
+  }
+  out
+}
+
+vulnerability_2024 <- panel_imp %>%
+  filter(Tahun == 2024, !is.na(ID_Kec)) %>%
+  transmute(
+    ID_Kec,
+    Vulnerability_Proxy_2024 = inv_minmax(Sinyal)
+  ) %>%
+  group_by(ID_Kec) %>%
+  summarise(
+    Vulnerability_Proxy_2024 = mean(Vulnerability_Proxy_2024, na.rm=TRUE),
+    .groups="drop"
+  )
+
+panel_imp <- panel_imp %>%
+  left_join(vulnerability_2024, by="ID_Kec") %>%
+  mutate(
+    Kepadatan_t=transform_if_skewed(Kepadatan),
+    Faskes_t=transform_if_skewed(Faskes),
+    Pendidikan_t=transform_if_skewed(Pendidikan),
+    Sinyal_t=transform_if_skewed(Sinyal),
+    Vulnerability_Proxy_t=Vulnerability_Proxy_2024
+  )
+```
+
+# PCA-based component indices
+
+```{r pca-indices}
+make_pca_index <- function(df, vars, id="ID_Kec", direction=1) {
+  x <- df %>% select(all_of(vars))
+  keep <- vapply(x, function(z) sum(is.finite(z)) > 1 && sd(z, na.rm=TRUE) > 0, logical(1))
+  x <- x[, keep, drop=FALSE]
+  if (!ncol(x)) stop("No usable variables for component index")
+  x <- as.data.frame(scale(x))
+  if (ncol(x)==1) {
+    score <- x[[1]]
+    ev <- 1
+    load <- 1
+  } else {
+    p <- prcomp(x, center=FALSE, scale.=FALSE)
+    score <- p$x[,1]
+    ev <- p$sdev[1]^2/sum(p$sdev^2)
+    load <- p$rotation[,1]
+  }
+  # Orient so larger average raw standardized values correspond to larger score.
+  if (cor(score, rowMeans(x), use="complete.obs") < 0) score <- -score
+  tibble::tibble(!!id := df[[id]], score=score, explained=ev)
+}
+
+build_component_indices <- function(start_year, end_year) {
+  dat <- panel_imp %>% filter(Tahun >= start_year, Tahun <= end_year, !is.na(ID_Kec))
+  district_avg <- dat %>%
+    group_by(ID_Kec) %>%
+    summarise(
+      Kepadatan_t=mean(Kepadatan_t, na.rm=TRUE),
+      Faskes_t=mean(Faskes_t, na.rm=TRUE),
+      Pendidikan_t=mean(Pendidikan_t, na.rm=TRUE),
+      Sinyal_t=mean(Sinyal_t, na.rm=TRUE),
+      Vulnerability_Proxy_t=mean(Vulnerability_Proxy_t, na.rm=TRUE),
+      .groups="drop"
+    )
+
+  exp_idx <- make_pca_index(district_avg, c("Kepadatan_t","Faskes_t","Pendidikan_t")) %>%
+    transmute(ID_Kec, Exp_Index=score, Exp_Explained=explained)
+
+  vul_idx <- make_pca_index(district_avg, c("Vulnerability_Proxy_t")) %>%
+    transmute(ID_Kec, Vul_Index=score, Vul_Explained=explained)
+
+  left_join(exp_idx, vul_idx, by="ID_Kec")
+}
+
+pca_2019_2025 <- build_component_indices(2019, 2025)
+pca_2023_2025 <- build_component_indices(2023, 2025)
+pca_2024_2025 <- build_component_indices(2024, 2025)
+```
+
+# Earthquake catalog and magnitude harmonization
+
+```{r earthquake-catalog}
+convert_to_Mw <- function(M, mag_type) {
+  mt <- toupper(trimws(ifelse(is.na(mag_type), "", mag_type)))
+  out <- M
+  out[mt=="M"] <- 1.0166*M[mt=="M"] - 0.2207
+  idx <- mt=="MB" & M <= 6.2; out[idx] <- 0.933*M[idx] + 0.52
+  idx <- mt=="MB" & M > 6.2;  out[idx] <- 1.273*M[idx] - 1.2
+  idx <- mt %in% c("MLV","ML"); out[idx] <- 0.756*M[idx] + 1.060
+  idx <- mt=="MW(MB)"; out[idx] <- 0.898*M[idx] + 0.597
+  out
+}
+
+eq <- eq_raw %>%
+  filter(Tahun >= CFG$hazard_start, Tahun <= CFG$hazard_end) %>%
+  mutate(Mw=convert_to_Mw(Magnitude, Mag.Type)) %>%
+  filter(is.finite(Latitude), is.finite(Longitude), is.finite(Mw), is.finite(Depth))
+
+eq_sf <- st_as_sf(eq, coords=c("Longitude","Latitude"), crs=4326) %>% st_transform(CFG$utm_crs)
+```
+
+# Ground-motion proxy
+
+```{r gmpe}
+gmpe_proxy <- function(M, R, Vs30, coeff=CFG$gmpe) {
+  dm <- ifelse(M > coeff$Mh, M-coeff$Mh, 0)
+  FE <- coeff$c0 + coeff$c1*M + coeff$c2*M^2 + ifelse(M<=coeff$Mh,0,coeff$c4*dm)
+  FP <- coeff$c3*log(pmax(R,1)/coeff$Rref) +
+    ifelse(M<=coeff$Mh,
+           coeff$c4*M*log(pmax(R,1)/coeff$Rref),
+           coeff$c4*coeff$Mh*log(pmax(R,1)/coeff$Rref))
+  FS_lin <- coeff$c7*log(Vs30/coeff$Vref)
+  PGA_ref <- exp(FE+FP)
+  f2 <- ifelse(Vs30<=coeff$V1,
+               coeff$b1*log(pmax(PGA_ref,1e-8)/0.1),
+               ifelse(Vs30<=coeff$V2,
+                      coeff$b1*log(pmax(PGA_ref,1e-8)/0.1) +
+                        coeff$b2*log(pmax(PGA_ref,1e-8)/0.1)*log(Vs30/coeff$V1)/log(coeff$V2/coeff$V1),
+                      0))
+  exp(FE+FP+FS_lin+f2)
+}
+
+# Mw 6.8 scenario, 10-km depth, district-centroid distance to fault.
+R_scen <- sqrt(kecamatan_sf$Distance_to_fault_km^2 + 10^2)
+kecamatan_sf$PGA_scenario <- gmpe_proxy(CFG$scenario_mw, R_scen, kecamatan_sf$Vs30_model)
+kecamatan_sf$Affected_MMI_VI <- kecamatan_sf$PGA_scenario >= CFG$pga_threshold
+```
+
+# Annual district-level hazard proxy
+
+The working analysis defines the annual hazard probability as the proportion of cataloged events in a year whose GMPE-derived PGA at a district exceeds 0.092 g. This is a **model-derived screening probability**, not an empirical exceedance frequency from accelerograph observations.
+
+```{r annual-hazard, cache=TRUE}
+# WARNING: this loop can be computationally expensive for the full BMKG catalog.
+# To preserve the supplied analysis definition, no arbitrary geographic filter is imposed here.
+
+eq_xy <- st_coordinates(eq_sf)
+n_kec <- nrow(kecamatan_sf)
+years_h <- CFG$hazard_start:CFG$hazard_end
+annual_prob <- matrix(NA_real_, nrow=n_kec, ncol=length(years_h), dimnames=list(NULL,years_h))
+annual_pga_max <- matrix(NA_real_, nrow=n_kec, ncol=length(years_h), dimnames=list(NULL,years_h))
+
+for (yy in seq_along(years_h)) {
+  idx <- which(eq$Tahun == years_h[yy])
+  if (!length(idx)) {
+    annual_prob[,yy] <- 0.001
+    annual_pga_max[,yy] <- 0
+    next
+  }
+  pga_mat <- matrix(NA_real_, nrow=n_kec, ncol=length(idx))
+  for (jj in seq_along(idx)) {
+    k <- idx[jj]
+    d_h <- sqrt((coords_utm[,1]-eq_xy[k,1])^2 + (coords_utm[,2]-eq_xy[k,2])^2)/1000
+    R3 <- sqrt(d_h^2 + eq$Depth[k]^2)
+    pga_mat[,jj] <- gmpe_proxy(eq$Mw[k], R3, kecamatan_sf$Vs30_model)
+  }
+  annual_pga_max[,yy] <- apply(pga_mat,1,max,na.rm=TRUE)
+  annual_prob[,yy] <- rowMeans(pga_mat >= CFG$pga_threshold, na.rm=TRUE)
+  annual_prob[,yy] <- pmin(pmax(annual_prob[,yy],0.001),0.999)
+}
+
+# Align 2019-2025 panel; carry 2024 forward as an explicitly labeled 2025 proxy.
+model_years <- CFG$model_years
+haz_prob <- matrix(NA_real_, nrow=n_kec, ncol=length(model_years), dimnames=list(NULL,model_years))
+for (tt in seq_along(model_years)) {
+  if (model_years[tt] <= CFG$hazard_end) haz_prob[,tt] <- annual_prob[,as.character(model_years[tt])]
+}
+haz_prob[,"2025"] <- haz_prob[,"2024"]
+```
+
+# Bayesian INLA-SPDE model
+
+The second-stage model smooths the bounded GMPE-derived district-year exceedance fractions on the logit scale. A Gaussian latent model is fitted to the logit-transformed fractions, with an explicit likelihood-strength weight used only for sensitivity analysis. This avoids converting small continuous exceedance fractions into rounded pseudo-counts, which can collapse all responses to zero when the effective trial count is small.
+
+```{r inla-model, cache=TRUE}
+# Mesh
+bbox <- st_bbox(kecamatan_utm)
+diag_m <- sqrt((bbox$xmax-bbox$xmin)^2 + (bbox$ymax-bbox$ymin)^2)
+mesh <- inla.mesh.2d(
+  loc=coords_utm,
+  boundary=list(inla.nonconvex.hull(coords_utm, convex=-0.05)),
+  max.edge=c(0.03,0.08)*diag_m,
+  cutoff=0.005*diag_m
+)
+
+make_model_data <- function(n_eff=CFG$n_eff) {
+  dat <- expand.grid(ID_Kec=seq_len(n_kec), Tahun=model_years) %>%
+    arrange(ID_Kec,Tahun) %>% mutate(ID_Tahun=match(Tahun,model_years))
+  dat$p_hazard <- mapply(function(i,t) haz_prob[i,as.character(t)], dat$ID_Kec, dat$Tahun)
+  dat$p_hazard <- pmin(pmax(dat$p_hazard,0.001),0.999)
+  # Preserve small exceedance fractions instead of rounding them to zero.
+  dat$Y <- qlogis(dat$p_hazard)
+  dat$LikelihoodWeight <- rep(as.numeric(n_eff), nrow(dat))
+  dat
+}
+
+fit_inla_model <- function(model_type=c("intercept","temporal","spatial","full"), n_eff=CFG$n_eff,
+                           range_km=CFG$pc_range_km, sigma0=CFG$pc_sigma) {
+  model_type <- match.arg(model_type)
+  dat <- make_model_data(n_eff)
+  n <- nrow(dat)
+
+  if (model_type %in% c("spatial","full")) {
+    spde <- inla.spde2.pcmatern(mesh, alpha=2,
+      prior.range=c(range_km*1000, CFG$pc_prob),
+      prior.sigma=c(sigma0, CFG$pc_prob))
+
+    if (model_type=="full") {
+      A <- inla.spde.make.A(mesh, loc=coords_utm[dat$ID_Kec,,drop=FALSE], group=dat$ID_Tahun, n.group=length(model_years))
+      idx <- inla.spde.make.index("spatial", n.spde=spde$n.spde, n.group=length(model_years))
+      fx <- data.frame(Intercept=rep(1, n), ID_Tahun=dat$ID_Tahun)
+      stopifnot(nrow(A) == n, nrow(fx) == n)
+      stk <- inla.stack(data=list(Y=dat$Y), A=list(A,1), effects=list(idx,fx), tag="est")
+      form <- Y ~ -1 + Intercept + f(spatial, model=spde, group=spatial.group, control.group=list(model="iid")) + f(ID_Tahun, model="rw1")
+    } else {
+      A <- inla.spde.make.A(mesh, loc=coords_utm[dat$ID_Kec,,drop=FALSE])
+      idx <- inla.spde.make.index("spatial", n.spde=spde$n.spde)
+      fx <- data.frame(Intercept=rep(1, n))
+      stopifnot(nrow(A) == n, nrow(fx) == n)
+      stk <- inla.stack(data=list(Y=dat$Y), A=list(A,1), effects=list(idx,fx), tag="est")
+      form <- Y ~ -1 + Intercept + f(spatial, model=spde)
+    }
+  } else {
+    fx <- data.frame(Intercept=rep(1, n), ID_Tahun=dat$ID_Tahun)
+    stopifnot(nrow(fx) == n)
+    stk <- inla.stack(data=list(Y=dat$Y), A=list(1), effects=list(fx), tag="est")
+    form <- if (model_type=="temporal") Y ~ -1 + Intercept + f(ID_Tahun, model="rw1") else Y ~ -1 + Intercept
+  }
+
+  fit <- inla(
+    form,
+    data=inla.stack.data(stk),
+    family="gaussian",
+    weights=dat$LikelihoodWeight,
+    control.predictor=list(A=inla.stack.A(stk), compute=TRUE),
+    control.compute=list(dic=TRUE, waic=TRUE, cpo=TRUE, config=TRUE),
+    control.inla=list(strategy="gaussian", int.strategy="eb"),
+    verbose=FALSE
+  )
+
+  idata <- inla.stack.index(stk,"est")$data
+
+  # Transform posterior summaries from the logit scale back to the
+  # annual exceedance-fraction scale.
+  lp <- fit$summary.linear.predictor[idata,,drop=FALSE]
+  p_linkmean <- plogis(lp$mean)
+  p_q025 <- plogis(lp$`0.025quant`)
+  p_q975 <- plogis(lp$`0.975quant`)
+
+  post_year <- tibble::tibble(
+    ID_Kec=dat$ID_Kec,
+    Tahun=dat$Tahun,
+    p_hazard_input=dat$p_hazard,
+    posterior_exceedance=p_linkmean,
+    fitted_mean=p_linkmean,
+    fitted_sd=(p_q975-p_q025)/3.92,
+    q025=p_q025,
+    q975=p_q975
+  )
+
+  post <- post_year %>%
+    group_by(ID_Kec) %>%
+    summarise(
+      p_mean_avg=mean(posterior_exceedance,na.rm=TRUE),
+      fitted_mean_avg=mean(fitted_mean,na.rm=TRUE),
+      fitted_sd_avg=mean(fitted_sd,na.rm=TRUE),
+      q025_avg=mean(q025,na.rm=TRUE),
+      q975_avg=mean(q975,na.rm=TRUE),
+      ci_width_avg=mean(q975-q025,na.rm=TRUE),
+      .groups="drop"
+    )
+
+  metrics <- tibble::tibble(
+    Model=model_type,
+    DIC=fit$dic$dic,
+    WAIC=fit$waic$waic,
+    SumLogCPO=sum(log(fit$cpo$cpo),na.rm=TRUE),
+    CPO_Failure=sum(fit$cpo$failure>0,na.rm=TRUE)
+  )
+  list(fit=fit, data=dat, stack=stk, posterior=post, posterior_year=post_year, metrics=metrics)
+}
+
+fits <- lapply(c("intercept","temporal","spatial","full"), fit_inla_model)
+names(fits) <- c("intercept","temporal","spatial","full")
+model_comparison <- bind_rows(lapply(fits, `[[`, "metrics")) %>% arrange(DIC)
+
+# Export diagnostics for the Shiny app only after the INLA models have actually run.
+derived_dir <- file.path(dirname(DATA_DIR), "derived")
+dir.create(derived_dir, showWarnings=FALSE, recursive=TRUE)
+readr::write_csv(model_comparison, file.path(derived_dir, "model_comparison_live.csv"))
+
+kable(model_comparison, digits=2)
+
+final_fit <- fits$full
+
+# Export the posterior fitted exceedance-screening surface used by the paper.
+posterior_year_live <- final_fit$posterior_year %>%
+  left_join(lookup_kec,by="ID_Kec")
+
+posterior_summary_live <- final_fit$posterior %>%
+  left_join(lookup_kec,by="ID_Kec")
+
+readr::write_csv(
+  posterior_year_live,
+  file.path(derived_dir,"posterior_exceedance_year_live.csv")
+)
+readr::write_csv(
+  posterior_summary_live,
+  file.path(derived_dir,"posterior_exceedance_summary_live.csv")
+)
+
+# Supplementary high-resolution visualization of the fitted full SPDE model.
+# This does NOT downscale exposure/vulnerability and is therefore not an
+# integrated high-resolution risk map. It is a continuous posterior shaking-
+# screening surface implied by the SPDE component.
+try({
+  spatial_sum <- final_fit$fit$summary.random$spatial
+  temporal_sum <- final_fit$fit$summary.random$ID_Tahun
+  intercept_mean <- as.numeric(final_fit$fit$summary.fixed["Intercept","mean"])
+
+  n_spde <- mesh$n
+  n_year <- length(model_years)
+
+  if(!is.null(spatial_sum) &&
+     nrow(spatial_sum) >= n_spde*n_year &&
+     !is.null(temporal_sum)) {
+
+    spatial_mean <- matrix(
+      spatial_sum$mean[seq_len(n_spde*n_year)],
+      nrow=n_spde,
+      ncol=n_year
+    )
+
+    temp_mean <- rep(0,n_year)
+    if("mean" %in% names(temporal_sum)){
+      jj <- seq_len(min(n_year,nrow(temporal_sum)))
+      temp_mean[jj] <- temporal_sum$mean[jj]
+    }
+
+    bb_hr <- sf::st_bbox(study_area_outline)
+    grid_res_m <- 1000
+
+    xs <- seq(
+      floor(bb_hr["xmin"]/grid_res_m)*grid_res_m,
+      ceiling(bb_hr["xmax"]/grid_res_m)*grid_res_m,
+      by=grid_res_m
+    )
+    ys <- seq(
+      floor(bb_hr["ymin"]/grid_res_m)*grid_res_m,
+      ceiling(bb_hr["ymax"]/grid_res_m)*grid_res_m,
+      by=grid_res_m
+    )
+
+    proj_hr <- inla.mesh.projector(
+      mesh,
+      xlim=range(xs),
+      ylim=range(ys),
+      dims=c(length(xs),length(ys))
+    )
+
+    p_stack <- vector("list",n_year)
+    for(tt in seq_len(n_year)){
+      sp_grid <- inla.mesh.project(proj_hr,spatial_mean[,tt])
+      p_stack[[tt]] <- plogis(intercept_mean + sp_grid + temp_mean[tt])
+    }
+
+    p_hr <- Reduce("+",p_stack)/n_year
+    grd <- expand.grid(x=proj_hr$x,y=proj_hr$y)
+    grd$posterior_exceedance_hr <- as.vector(p_hr)
+
+    grd_sf <- sf::st_as_sf(grd,coords=c("x","y"),crs=32748,remove=FALSE)
+    inside <- lengths(sf::st_within(grd_sf,study_area_outline))>0
+    grd_sf <- grd_sf[inside,]
+
+    grd_wgs <- sf::st_transform(grd_sf,4326)
+    xy_wgs <- sf::st_coordinates(grd_wgs)
+
+    hr_out <- tibble::tibble(
+      longitude=xy_wgs[,1],
+      latitude=xy_wgs[,2],
+      posterior_exceedance_hr=grd_sf$posterior_exceedance_hr
+    ) %>%
+      filter(is.finite(posterior_exceedance_hr))
+
+    readr::write_csv(
+      hr_out,
+      file.path(derived_dir,"posterior_spde_highres_live.csv")
+    )
+  }
+},silent=TRUE)
+```
+
+# Integrated relative seismic screening score
+
+```{r risk-score}
+W <- c(H=0.60,E=0.30,V=0.10)
+screening <- final_fit$posterior %>%
+  left_join(pca_2019_2025, by="ID_Kec") %>%
+  left_join(lookup_kec, by="ID_Kec") %>%
+  mutate(
+    Hazard_Index=normalize01(p_mean_avg),
+    Exposure_Index=normalize01(Exp_Index),
+    Vulnerability_Index=normalize01(Vul_Index),
+    Screening_Score=100*(W["H"]*Hazard_Index + W["E"]*Exposure_Index + W["V"]*Vulnerability_Index)
+  ) %>% arrange(desc(Screening_Score)) %>% mutate(Rank=row_number())
+
+# Export manuscript-derived district layers for the companion Shiny application.
+derived_dir <- file.path(dirname(DATA_DIR), "derived")
+dir.create(derived_dir, showWarnings=FALSE, recursive=TRUE)
+
+screening_live <- screening %>%
+  left_join(
+    kecamatan_sf %>%
+      sf::st_drop_geometry() %>%
+      select(ID_Kec, PGA_scenario, Vs30_model),
+    by="ID_Kec"
+  ) %>%
+  select(
+    ID_Kec, kabupaten, kecamatan,
+    p_mean_avg, Exp_Index, Vul_Index,
+    Hazard_Index, Exposure_Index, Vulnerability_Index,
+    Screening_Score, Rank, PGA_scenario, Vs30_model
+  )
+
+readr::write_csv(
+  screening_live,
+  file.path(derived_dir, "screening_map_live.csv")
+)
+
+kable(screening %>% slice_head(n=10) %>% select(Rank,kabupaten,kecamatan,Screening_Score,p_mean_avg), digits=3)
+```
+
+# Sensitivity analysis
+
+```{r sensitivity, cache=TRUE}
+# Screening-score weight sensitivity
+weight_sets <- list(
+  `60:30:10`=c(H=.60,E=.30,V=.10),
+  `50:25:25`=c(H=.50,E=.25,V=.25),
+  `50:30:20`=c(H=.50,E=.30,V=.20),
+  `70:20:10`=c(H=.70,E=.20,V=.10)
+)
+
+make_rank <- function(post,pca,W) {
+  post %>% left_join(pca,by="ID_Kec") %>%
+    mutate(H=normalize01(p_mean_avg),E=normalize01(Exp_Index),V=normalize01(Vul_Index),
+           Screening_Score=100*(W["H"]*H+W["E"]*E+W["V"]*V)) %>%
+    arrange(desc(Screening_Score)) %>% mutate(Rank=row_number())
+}
+
+base_rank <- make_rank(final_fit$posterior,pca_2019_2025,weight_sets[["60:30:10"]])
+weight_sens <- bind_rows(lapply(names(weight_sets), function(nm) {
+  rr <- make_rank(final_fit$posterior,pca_2019_2025,weight_sets[[nm]])
+  st <- rank_stability(base_rank,rr)
+  tibble::tibble(Scenario=nm,Spearman=st$spearman,Top10_Overlap=st$top10_overlap)
+}))
+
+# PCA-window sensitivity
+pca_sets <- list(`2019-2025`=pca_2019_2025,`2023-2025`=pca_2023_2025,`2024-2025`=pca_2024_2025)
+pca_sens <- bind_rows(lapply(names(pca_sets), function(nm) {
+  rr <- make_rank(final_fit$posterior,pca_sets[[nm]],weight_sets[["60:30:10"]])
+  st <- rank_stability(base_rank,rr)
+  tibble::tibble(Scenario=nm,Spearman=st$spearman,Top10_Overlap=st$top10_overlap)
+}))
+
+# n_eff sensitivity
+neff_sens <- bind_rows(lapply(c(2,3,5,10), function(ne) {
+  ff <- fit_inla_model("full", n_eff=ne)
+  rr <- make_rank(ff$posterior,pca_2019_2025,weight_sets[["60:30:10"]])
+  st <- rank_stability(base_rank,rr)
+  tibble::tibble(n_eff=ne,DIC=ff$metrics$DIC,WAIC=ff$metrics$WAIC,Spearman=st$spearman,Top10_Overlap=st$top10_overlap)
+}))
+
+# PC-prior sensitivity
+prior_grid <- bind_rows(
+  tibble::tibble(range_km=c(10,20,40),sigma0=CFG$pc_sigma),
+  tibble::tibble(range_km=CFG$pc_range_km,sigma0=c(0.5,1.0))
+) %>% distinct()
+prior_sens <- purrr::pmap_dfr(prior_grid, function(range_km,sigma0) {
+  ff <- fit_inla_model("full", range_km=range_km, sigma0=sigma0)
+  rr <- make_rank(ff$posterior,pca_2019_2025,weight_sets[["60:30:10"]])
+  st <- rank_stability(base_rank,rr)
+  tibble::tibble(range_km=range_km,sigma0=sigma0,DIC=ff$metrics$DIC,WAIC=ff$metrics$WAIC,Spearman=st$spearman,Top10_Overlap=st$top10_overlap)
+})
+
+# Export manuscript-ready sensitivity results used by the companion Shiny app.
+sensitivity_live <- bind_rows(
+  weight_sens %>% transmute(
+    sensitivity_factor="H:E:V weights",
+    setting=Scenario,
+    spearman_rho=Spearman,
+    top10_overlap=Top10_Overlap
+  ),
+  pca_sens %>% transmute(
+    sensitivity_factor="Averaging period",
+    setting=Scenario,
+    spearman_rho=Spearman,
+    top10_overlap=Top10_Overlap
+  ),
+  neff_sens %>% transmute(
+    sensitivity_factor="Effective likelihood strength",
+    setting=as.character(n_eff),
+    spearman_rho=Spearman,
+    top10_overlap=Top10_Overlap,
+    DIC=DIC,
+    WAIC=WAIC
+  ),
+  prior_sens %>% transmute(
+    sensitivity_factor="PC prior (range, SD)",
+    setting=paste0("(",range_km," km, ",sigma0,")"),
+    spearman_rho=Spearman,
+    top10_overlap=Top10_Overlap,
+    DIC=DIC,
+    WAIC=WAIC
+  )
+)
+
+readr::write_csv(
+  sensitivity_live,
+  file.path(derived_dir,"sensitivity_analysis_live.csv")
+)
+
+readr::write_csv(
+  screening %>% slice_head(n=10) %>%
+    select(Rank,kabupaten,kecamatan,Screening_Score,p_mean_avg),
+  file.path(derived_dir,"top10_screening_live.csv")
+)
+
+# Manuscript-ready outputs
+manuscript_dir <- file.path(dirname(DATA_DIR),"manuscript")
+dir.create(manuscript_dir,showWarnings=FALSE,recursive=TRUE)
+
+table1_manuscript <- sensitivity_live %>%
+  transmute(`Sensitivity factor`=sensitivity_factor,Setting=setting,
+            `Spearman rho`=spearman_rho,`Top-10 overlap`=top10_overlap)
+
+table2_manuscript <- bind_rows(lapply(fits,function(x) x$metrics)) %>%
+  select(Model,DIC,WAIC,SumLogCPO,CPO_Failure)
+
+table3_manuscript <- screening %>% slice_head(n=10) %>%
+  transmute(Rank=Rank,`Regency/City`=kabupaten,District=kecamatan,
+            `Screening Score`=Screening_Score,`Posterior Exceedance`=p_mean_avg)
+
+readr::write_csv(table1_manuscript,file.path(manuscript_dir,"Table1_Sensitivity.csv"))
+readr::write_csv(table2_manuscript,file.path(manuscript_dir,"Table2_INLA_Diagnostics.csv"))
+readr::write_csv(table3_manuscript,file.path(manuscript_dir,"Table3_Top10_Screening.csv"))
+
+top5 <- table3_manuscript %>% slice_head(n=5)
+summary_lines <- c(
+  paste0("Generated: ",format(Sys.time(),"%Y-%m-%d %H:%M:%S")),
+  paste0("Top district: ",top5$District[1]," (",top5$`Regency/City`[1],
+         "), screening score ",sprintf("%.3f",top5$`Screening Score`[1]),"."),
+  paste0("Top five districts: ",paste(top5$District,collapse=", "),"."),
+  paste0("Maximum posterior exceedance among top 10: ",
+         format(max(table3_manuscript$`Posterior Exceedance`,na.rm=TRUE),scientific=TRUE,digits=4),".")
+)
+writeLines(summary_lines,file.path(manuscript_dir,"manuscript_results_summary.txt"))
+
+kable(weight_sens,digits=3,caption="Screening-score weight sensitivity")
+kable(pca_sens,digits=3,caption="PCA-window sensitivity")
+kable(neff_sens,digits=3,caption="Effective likelihood strength sensitivity")
+kable(prior_sens,digits=3,caption="PC-prior sensitivity")
+```
+
+# Maps for IJGI
+
+```{r maps, fig.width=10, fig.height=7}
+map_screening <- kecamatan_sf %>%
+  left_join(screening %>% select(ID_Kec, Screening_Score, Rank, p_mean_avg), by="ID_Kec")
+
+# West Java background (kabupaten/kota boundaries only) for map context.
+jabar_kabkot_wgs <- st_transform(jabar_kabkot_sf, 4326)
+map_wgs <- st_transform(map_screening, 4326)
+study_outline_wgs <- st_transform(study_area_outline, 4326)
+fault_wgs <- st_transform(fault_sf, 4326)
+
+base_context <- list(
+  geom_sf(data=jabar_kabkot_wgs, fill="white", color="grey70", linewidth=.25)
+)
+
+common_theme <- theme_minimal() +
+  theme(
+    panel.grid.major = element_line(color="grey92", linewidth=.2),
+    axis.title = element_blank(),
+    axis.text = element_text(size=8),
+    plot.title = element_text(face="bold"),
+    plot.subtitle = element_text(size=9)
+  )
+
+p1 <- ggplot() +
+  base_context +
+  geom_sf(data=map_wgs, aes(fill=PGA_scenario), color="grey35", linewidth=.12) +
+  geom_sf(data=study_outline_wgs, fill=NA, color="black", linewidth=.65) +
+  geom_sf(data=fault_wgs, color="red", linewidth=1.1) +
+  labs(
+    title="Scenario Ground-Motion Proxy",
+    subtitle=paste0(
+      "West Java context with kabupaten/kota boundaries; study area outlined in black. Mw ",
+      CFG$scenario_mw, "; threshold = ", CFG$pga_threshold, " g"
+    )
+  ) +
+  scale_fill_viridis_c(name="PGA proxy (g)", na.value="white") +
+  coord_sf(expand=FALSE) +
+  common_theme
+
+p2 <- ggplot() +
+  base_context +
+  geom_sf(data=map_wgs, aes(fill=Screening_Score), color="grey35", linewidth=.12) +
+  geom_sf(data=study_outline_wgs, fill=NA, color="black", linewidth=.65) +
+  geom_sf(data=fault_wgs, color="red", linewidth=1.1) +
+  labs(
+    title="Integrated Relative Seismic Screening Score",
+    subtitle="West Java context with kabupaten/kota boundaries; baseline H:E:V = 60:30:10"
+  ) +
+  scale_fill_viridis_c(name="Screening score", na.value="white") +
+  coord_sf(expand=FALSE) +
+  common_theme
+
+ggsave(file.path(manuscript_dir,"Figure2_GroundMotionProxy.png"),p1,width=8.2,height=6.0,dpi=400,bg="white")
+ggsave(file.path(manuscript_dir,"Figure3_IntegratedScreening.png"),p2,width=8.2,height=6.0,dpi=400,bg="white")
+
+map_post <- kecamatan_sf %>%
+  left_join(final_fit$posterior %>% select(ID_Kec,p_mean_avg,ci_width_avg),by="ID_Kec") %>%
+  st_transform(4326)
+
+p_post <- ggplot() + base_context +
+  geom_sf(data=map_post,aes(fill=p_mean_avg),color="grey35",linewidth=.12) +
+  geom_sf(data=study_outline_wgs,fill=NA,color="black",linewidth=.65) +
+  geom_sf(data=fault_wgs,color="red",linewidth=1.1) +
+  labs(title="Posterior Exceedance-Screening Probability",
+       subtitle="District mean over model years; Bayesian weighted logit-Gaussian screening quantity") +
+  scale_fill_viridis_c(name="Posterior\nexceedance",labels=scales::label_scientific(digits=2),na.value="white") +
+  coord_sf(expand=FALSE) + common_theme
+
+ggsave(file.path(manuscript_dir,"Figure4_PosteriorExceedance.png"),p_post,width=8.2,height=6.0,dpi=400,bg="white")
+
+hr_path <- file.path(derived_dir,"posterior_spde_highres_live.csv")
+if(file.exists(hr_path)){
+  hr <- readr::read_csv(hr_path,show_col_types=FALSE)
+  if(nrow(hr)){
+    p_hr <- ggplot() + base_context +
+      geom_raster(data=hr,aes(x=longitude,y=latitude,fill=posterior_exceedance_hr),interpolate=TRUE) +
+      geom_sf(data=study_outline_wgs,fill=NA,color="black",linewidth=.65) +
+      geom_sf(data=fault_wgs,color="red",linewidth=1.0) +
+      scale_fill_viridis_c(name="Posterior\nexceedance",labels=scales::label_scientific(digits=2)) +
+      coord_sf(expand=FALSE) +
+      labs(title="Supplementary High-Resolution SPDE Posterior Surface",
+           subtitle="Continuous shaking-screening surface; not a high-resolution integrated risk map") +
+      common_theme
+    ggsave(file.path(manuscript_dir,"FigureS1_HighResolution_SPDE.png"),p_hr,width=8.2,height=6.0,dpi=400,bg="white")
+  }
+}
+
+p1 / p2
+```
+
+# Reproducibility record
+
+```{r session-info}
+cat("Data directory:", normalizePath(DATA_DIR), "\n")
+cat("Vulnerability layer: inverse 2024 BPS Sinyal/connectivity proxy (not age-ratio or road-damage measure)", "\n")
+cat("Baseline n_eff:", CFG$n_eff, "\n")
+cat("Baseline PC prior range threshold (km):", CFG$pc_range_km, "\n")
+cat("Baseline PC prior sigma threshold:", CFG$pc_sigma, "\n")
+cat("PGA threshold (g):", CFG$pga_threshold, "\n")
+sessionInfo()
+```
+
