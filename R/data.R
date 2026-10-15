@@ -1,17 +1,28 @@
 APP_VERSION <- "4.5.0"
 
+resolve_data_file <- function(filename) {
+  candidates <- c(
+    file.path("data", "derived", filename),
+    file.path("data", "example_outputs", filename),
+    file.path("data", filename)
+  )
+  hit <- candidates[file.exists(candidates)]
+  if (!length(hit)) stop("Missing data file: ", filename)
+  hit[1]
+}
+
 top10 <- readr::read_csv(
-  file.path("data", "top10_screening.csv"),
+  resolve_data_file("top10_screening.csv"),
   show_col_types = FALSE
 )
 
 sensitivity <- readr::read_csv(
-  file.path("data", "sensitivity_analysis.csv"),
+  resolve_data_file("sensitivity_analysis.csv"),
   show_col_types = FALSE
 )
 
 models <- readr::read_csv(
-  file.path("data", "model_comparison.csv"),
+  resolve_data_file("model_comparison.csv"),
   show_col_types = FALSE
 )
 
