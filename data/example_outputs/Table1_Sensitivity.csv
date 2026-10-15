@@ -1,0 +1,17 @@
+Sensitivity factor,Setting,Spearman rho,Top-10 overlap
+H:E:V weights,60:30:10,1.000,1.0
+H:E:V weights,50:25:25,0.900,0.8
+H:E:V weights,50:30:20,0.969,0.9
+H:E:V weights,70:20:10,0.987,0.9
+Averaging period,2019-2025,1.000,1.0
+Averaging period,2023-2025,0.908,0.8
+Averaging period,2024-2025,0.904,0.8
+Likelihood-strength weight,2,1.000,1.0
+Likelihood-strength weight,3,1.000,1.0
+Likelihood-strength weight,5,1.000,1.0
+Likelihood-strength weight,10,1.000,1.0
+"PC prior (range, SD)","(10 km, 1.5)",1.000,1.0
+"PC prior (range, SD)","(20 km, 1.5)",1.000,1.0
+"PC prior (range, SD)","(40 km, 1.5)",1.000,1.0
+"PC prior (range, SD)","(20 km, 0.5)",1.000,1.0
+"PC prior (range, SD)","(20 km, 1.0)",1.000,1.0
