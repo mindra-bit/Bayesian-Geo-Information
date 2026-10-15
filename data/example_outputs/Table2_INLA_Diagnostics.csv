@@ -1,0 +1,5 @@
+Model,DIC,WAIC,SumLogCPO,CPO_Failure
+Full spatial-temporal,-13816.17,61651.99,5013.96,0
+Spatial,9750.90,10597.61,-5133.41,0
+Temporal,15080.13,15108.23,-7547.15,0
+Intercept,16118.04,16122.04,-8060.02,0
