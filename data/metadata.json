@@ -1,0 +1,23 @@
+{
+  "study_title": "Bayesian Geo-Information Screening of Seismic Shaking, Exposure, and Vulnerability in the Lembang Fault Region, West Java, Indonesia",
+  "spatial_unit": "District (kecamatan)",
+  "districts": 227,
+  "district_year_records": 1596,
+  "vs30_grid_records": 78000,
+  "earthquake_catalog_source_records": 217807,
+  "socioeconomic_period": "2019–2025",
+  "hazard_period": "2009–2024",
+  "scenario_mw": 6.8,
+  "screening_threshold_g": 0.092,
+  "baseline_weights": {
+    "hazard": 0.6,
+    "exposure": 0.3,
+    "vulnerability": 0.1
+  },
+  "baseline_n_eff": 3,
+  "baseline_pc_prior": {
+    "range_km": 20,
+    "sigma": 1.5
+  },
+  "interpretation": "Comparative screening indicator only; not an earthquake-occurrence forecast or physical-loss estimate."
+}
