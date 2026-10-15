@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this code or data workflow, please cite the associated manuscript."
+title: "Lembang Fault Bayesian Geo-Information Screening: Reproducible R Workflow"
+type: software
+authors:
+  - family-names: Imtiyaz
+    given-names: Salwa Azzah
+  - family-names: Jaya
+    given-names: I Gede Nyoman Mindra
+  - family-names: Suparman
+    given-names: Yusep
+  - family-names: Kristiani
+    given-names: Farah
+version: "1.0.0"
+date-released: 2026-10-16
+repository-code: "https://github.com/mindra-bit/Bayesian-Geo-Information"
+preferred-citation:
+  type: article
+  title: "Bayesian Geo-Information Screening of Seismic Shaking, Exposure, and Vulnerability in the Lembang Fault Region, West Java, Indonesia"
+  authors:
+    - family-names: Imtiyaz
+      given-names: Salwa Azzah
+    - family-names: Jaya
+      given-names: I Gede Nyoman Mindra
+    - family-names: Suparman
+      given-names: Yusep
+    - family-names: Kristiani
+      given-names: Farah
+  year: 2026
