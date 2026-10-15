@@ -1,0 +1,9 @@
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+*.html
+*.docx
+data/raw/
+data/derived/
+data/manuscript/
