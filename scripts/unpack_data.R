@@ -48,6 +48,16 @@ if (file.exists(archive)) {
 
   boundary_dir <- file.path(source_dir, "boundaries")
   boundary_files <- list.files(boundary_dir, pattern = "\\.geojson$", full.names = TRUE)
+
+  # Reviewer-friendly alternative: upload small ZIP parts directly under data/source/.
+  boundary_zips <- list.files(source_dir, pattern = "^boundaries_part_[0-9]+\\.zip$", full.names = TRUE)
+  if (!length(boundary_files) && length(boundary_zips)) {
+    tmp_boundaries <- tempfile("lembang_boundaries_")
+    dir.create(tmp_boundaries)
+    for (z in boundary_zips) unzip(z, exdir = tmp_boundaries)
+    boundary_files <- list.files(tmp_boundaries, pattern = "\\.geojson$", full.names = TRUE)
+  }
+
   if (length(boundary_files)) {
     if (!requireNamespace("sf", quietly = TRUE)) stop("Package 'sf' is required to rebuild the GeoPackage.")
     parts <- lapply(boundary_files, sf::st_read, quiet = TRUE)
