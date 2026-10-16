@@ -17,13 +17,22 @@ Jaya et al. use a Bayesian spatio-temporal ETAS model for conditional short-hori
 - `app.R` and `run_app.R` — companion Shiny dashboard source and launcher.
 - `www/` — dashboard static assets.
 - `scripts/` — package installation, checks, and data extraction.
-- `data/archive/Lembang_raw_data.zip` — compressed source-data bundle.
+- `data/source/` — reviewer-friendly source data (small CSV/KML files plus partitioned GeoJSON boundaries).
+- `data/archive/Lembang_raw_data.zip` — optional legacy all-in-one archive.
 - `data/example_outputs/` — selected outputs from the completed aligned workflow.
 - `run_analysis.R` — one-command rendering script for the full analysis.
 
 ## Data preparation
 
-The administrative GeoPackage is larger than GitHub's normal 100 MB per-file limit when uncompressed. Therefore, all five raw inputs are distributed in one compressed archive below that limit.
+The preferred public layout is `data/source/` so reviewers can inspect each source separately. The intended contents are:
+
+1. `Data BPS.csv`
+2. `DATA_VS30_LENGKAP.csv`
+3. `BMKG_Earthquake_Catalog.csv.gz`
+4. `titik_sesar_lembang.kml`
+5. `boundaries/*.geojson` — West Java village/kelurahan boundaries partitioned by kabupaten/kota.
+
+The original boundary GeoPackage is about 107 MB, so it is converted to partitioned GeoJSON rather than committed as one oversized binary file. `scripts/unpack_data.R` combines the GeoJSON partitions and rebuilds `data/raw/Batas_Desa_Kelurahan_JABAR.gpkg` locally.
 
 From the repository root run:
 
@@ -31,15 +40,7 @@ From the repository root run:
 source("scripts/unpack_data.R")
 ```
 
-This creates `data/raw/` with:
-
-1. `Data BPS.csv`
-2. `DATA_VS30_LENGKAP.csv`
-3. `BMKG_Earthquake_Catalog.csv`
-4. `Batas_Desa_Kelurahan_JABAR.gpkg`
-5. `titik_sesar_lembang.kmz`
-
-`data/raw/` is intentionally ignored by Git after extraction.
+The script also remains backward-compatible with the optional legacy `data/archive/Lembang_raw_data.zip` bundle. `data/raw/` is intentionally ignored by Git because it contains generated working copies.
 
 ## R requirements
 
